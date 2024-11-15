@@ -1,6 +1,5 @@
 use http::Uri;
-use http_body::combinators::UnsyncBoxBody;
-use hyper::client::HttpConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
 use orchard::{note_encryption::OrchardDomain, tree::MerkleHashOrchard};
 use sapling_crypto::note_encryption::SaplingDomain;
 use std::{
@@ -14,12 +13,11 @@ use std::{
 };
 use tempdir;
 use tokio::time::sleep;
-use tonic::Status;
-use tower::{util::BoxCloneService, ServiceExt};
+use tower::ServiceExt;
 use zcash_primitives::consensus::BranchId;
 use zcash_primitives::{merkle_tree::read_commitment_tree, transaction::Transaction};
-use zingo_testutils::{
-    self,
+use zingo_netutils::UnderlyingService;
+use zingolib::testutils::{
     incrementalmerkletree::frontier::CommitmentTree,
     paths::{get_bin_dir, get_cargo_manifest_dir},
     regtest::launch_lightwalletd,
@@ -39,13 +37,6 @@ use super::{
     constants,
     darkside_types::{RawTransaction, TreeState},
 };
-
-type UnderlyingService = BoxCloneService<
-    http::Request<UnsyncBoxBody<prost::bytes::Bytes, Status>>,
-    http::Response<hyper::Body>,
-    hyper::Error,
->;
-
 macro_rules! define_darkside_connector_methods(
     ($($name:ident (&$self:ident $(,$param:ident: $param_type:ty)*$(,)?) -> $return:ty {$param_packing:expr}),*) => {$(
         #[allow(unused)]
@@ -76,7 +67,7 @@ impl DarksideConnector {
             let mut http_connector = HttpConnector::new();
             http_connector.enforce_http(false);
             let connector = tower::ServiceBuilder::new().service(http_connector);
-            let client = Box::new(hyper::Client::builder().http2_only(true).build(connector));
+            let client = zingo_netutils::client::client_from_connector(connector, true);
             let uri = uri.clone();
             let svc = tower::ServiceBuilder::new()
                 //Here, we take all the pieces of our uri, and add in the path from the Requests's uri
@@ -270,7 +261,9 @@ impl Drop for DarksideHandler {
             .is_err()
         {
             // if regular kill doesn't work, kill it harder
-            let _ = self.lightwalletd_handle.kill();
+            self.lightwalletd_handle
+                .kill()
+                .expect("command couldn't be killed");
         }
     }
 }
@@ -397,7 +390,7 @@ pub async fn init_darksidewalletd(
     set_port: Option<portpicker::Port>,
 ) -> Result<(DarksideHandler, DarksideConnector), String> {
     let handler = DarksideHandler::new(set_port);
-    let server_id = zingoconfig::construct_lightwalletd_uri(Some(format!(
+    let server_id = zingolib::config::construct_lightwalletd_uri(Some(format!(
         "http://127.0.0.1:{}",
         handler.grpc_port
     )));
@@ -499,10 +492,10 @@ pub mod scenarios {
     };
     use zcash_client_backend::{PoolType, ShieldedProtocol};
     use zcash_primitives::consensus::{BlockHeight, BranchId};
-    use zingo_testutils::scenarios::setup::ClientBuilder;
-    use zingo_testvectors::seeds::HOSPITAL_MUSEUM_SEED;
-    use zingoconfig::RegtestNetwork;
+    use zingolib::config::RegtestNetwork;
     use zingolib::lightclient::LightClient;
+    use zingolib::testutils::scenarios::setup::ClientBuilder;
+    use zingolib::testvectors::seeds::HOSPITAL_MUSEUM_SEED;
 
     use super::{
         init_darksidewalletd, update_tree_states_for_transaction, write_raw_transaction,
@@ -564,7 +557,7 @@ pub mod scenarios {
             self.faucet = Some(
                 self.client_builder
                     .build_client(
-                        zingo_testvectors::seeds::DARKSIDE_SEED.to_string(),
+                        zingolib::testvectors::seeds::DARKSIDE_SEED.to_string(),
                         0,
                         true,
                         self.regtest_network,
@@ -679,7 +672,7 @@ pub mod scenarios {
                 DarksideSender::IndexedClient(n) => self.get_lightclient(n),
                 DarksideSender::ExternalClient(lc) => lc,
             };
-            zingo_testutils::lightclient::from_inputs::send(
+            zingolib::testutils::lightclient::from_inputs::quick_send(
                 lightclient,
                 vec![(receiver_address, value, None)],
             )
@@ -718,7 +711,6 @@ pub mod scenarios {
             // We can't just take a reference to a LightClient, as that might be a reference to
             // a field of the DarksideScenario which we're taking by exclusive (i.e. mut) reference
             sender: DarksideSender<'_>,
-            pool_to_shield: PoolType,
         ) -> (&mut DarksideEnvironment, RawTransaction) {
             self.staged_blockheight = self.staged_blockheight.add(1);
             self.darkside_connector
@@ -731,9 +723,7 @@ pub mod scenarios {
                 DarksideSender::ExternalClient(lc) => lc,
             };
             // upgrade sapling
-            zingo_testutils::lightclient::from_inputs::shield(lightclient, &[pool_to_shield], None)
-                .await
-                .unwrap();
+            lightclient.quick_shield().await.unwrap();
             let mut streamed_raw_txns = self
                 .darkside_connector
                 .get_incoming_transactions()
@@ -772,10 +762,9 @@ pub mod scenarios {
             // We can't just take a reference to a LightClient, as that might be a reference to
             // a field of the DarksideScenario which we're taking by exclusive (i.e. mut) reference
             sender: DarksideSender<'_>,
-            pool_to_shield: PoolType,
             chainbuild_file: &File,
         ) -> &mut DarksideEnvironment {
-            let (_, raw_tx) = self.shield_transaction(sender, pool_to_shield).await;
+            let (_, raw_tx) = self.shield_transaction(sender).await;
             write_raw_transaction(&raw_tx, BranchId::Nu5, chainbuild_file);
             self
         }

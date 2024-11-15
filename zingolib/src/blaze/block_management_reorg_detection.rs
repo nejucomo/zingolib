@@ -3,7 +3,7 @@ use crate::wallet::{
     data::{BlockData, PoolNullifier},
     notes::ShieldedNoteInterface,
     traits::DomainWalletExt,
-    tx_map_and_maybe_trees::TxMapAndMaybeTrees,
+    tx_map::TxMap,
 };
 use incrementalmerkletree::frontier::CommitmentTree;
 use incrementalmerkletree::{frontier, witness::IncrementalWitness, Hashable};
@@ -67,7 +67,7 @@ impl BlockManagementData {
             blocks_in_current_batch: Arc::new(RwLock::new(vec![])),
             existing_blocks: Arc::new(RwLock::new(vec![])),
             unverified_treestates: Arc::new(RwLock::new(vec![])),
-            batch_size: zingoconfig::BATCH_SIZE,
+            batch_size: crate::config::BATCH_SIZE,
             highest_verified_trees: None,
             sync_status,
         }
@@ -317,7 +317,7 @@ impl BlockManagementData {
     pub async fn invalidate_block(
         reorg_height: u64,
         existing_blocks: Arc<RwLock<Vec<BlockData>>>,
-        transaction_metadata_set: Arc<RwLock<TxMapAndMaybeTrees>>,
+        transaction_metadata_set: Arc<RwLock<TxMap>>,
     ) {
         let mut existing_blocks_writelock = existing_blocks.write().await;
         if existing_blocks_writelock.len() != 0 {
@@ -343,7 +343,7 @@ impl BlockManagementData {
         &self,
         start_block: u64,
         end_block: u64,
-        transaction_metadata_set: Arc<RwLock<TxMapAndMaybeTrees>>,
+        transaction_metadata_set: Arc<RwLock<TxMap>>,
         reorg_transmitter: UnboundedSender<Option<u64>>,
     ) -> (
         JoinHandle<Result<Option<u64>, String>>,
@@ -503,19 +503,14 @@ impl BlockManagementData {
     /// This function handles Orchard and Sapling domains.
     /// This function takes data from the light server and uses it to construct a witness locally.  should?
     /// currently of the opinion that this function should be factored into separate concerns.
-    pub(crate) async fn get_note_witness<D>(
+    pub(crate) async fn get_note_witness<D: DomainWalletExt>(
         &self,
-        uri: Uri,
+        lightwalletd_uri: Uri,
         height: BlockHeight,
         transaction_num: usize,
         output_num: usize,
         activation_height: u64,
     ) -> Result<IncrementalWitness<<D::WalletNote as ShieldedNoteInterface>::Node, 32>, String>
-    where
-        D: DomainWalletExt,
-        D::Note: PartialEq + Clone,
-        D::ExtractedCommitmentBytes: Into<[u8; 32]>,
-        D::Recipient: crate::wallet::traits::Recipient,
     {
         // Get the previous block's height, because that block's commitment trees are the states at the start
         // of the requested block.
@@ -526,7 +521,8 @@ impl BlockManagementData {
             let tree = if prev_height < activation_height {
                 frontier::CommitmentTree::<<D::WalletNote as ShieldedNoteInterface>::Node, 32>::empty()
             } else {
-                let tree_state = crate::grpc_connector::get_trees(uri, prev_height).await?;
+                let tree_state =
+                    crate::grpc_connector::get_trees(lightwalletd_uri, prev_height).await?;
                 let tree = hex::decode(D::get_tree(&tree_state)).unwrap();
                 self.unverified_treestates.write().await.push(tree_state);
                 read_commitment_tree(&tree[..]).map_err(|e| format!("{}", e))?
@@ -595,7 +591,7 @@ struct BlockManagementThreadData {
 impl BlockManagementThreadData {
     async fn handle_reorgs_populate_data_inner(
         mut self,
-        transaction_metadata_set: Arc<RwLock<TxMapAndMaybeTrees>>,
+        transaction_metadata_set: Arc<RwLock<TxMap>>,
         reorg_transmitter: UnboundedSender<Option<u64>>,
     ) -> Result<Option<u64>, String> {
         // Temporary holding place for blocks while we process them.
@@ -841,9 +837,7 @@ mod tests {
             .handle_reorgs_and_populate_block_mangement_data(
                 start_block,
                 end_block,
-                Arc::new(RwLock::new(
-                    TxMapAndMaybeTrees::new_with_witness_trees_address_free(),
-                )),
+                Arc::new(RwLock::new(TxMap::new_with_witness_trees_address_free())),
                 reorg_transmitter,
             )
             .await;
@@ -892,9 +886,7 @@ mod tests {
             .handle_reorgs_and_populate_block_mangement_data(
                 start_block,
                 end_block,
-                Arc::new(RwLock::new(
-                    TxMapAndMaybeTrees::new_with_witness_trees_address_free(),
-                )),
+                Arc::new(RwLock::new(TxMap::new_with_witness_trees_address_free())),
                 reorg_transmitter,
             )
             .await;
@@ -990,9 +982,7 @@ mod tests {
             .handle_reorgs_and_populate_block_mangement_data(
                 start_block,
                 end_block,
-                Arc::new(RwLock::new(
-                    TxMapAndMaybeTrees::new_with_witness_trees_address_free(),
-                )),
+                Arc::new(RwLock::new(TxMap::new_with_witness_trees_address_free())),
                 reorg_transmitter,
             )
             .await;

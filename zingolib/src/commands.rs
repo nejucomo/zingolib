@@ -2,6 +2,7 @@
 //! upgrade-or-replace
 
 use crate::data::proposal;
+use crate::wallet::keys::unified::UnifiedKeyStore;
 use crate::wallet::MemoDownloadOption;
 use crate::{lightclient::LightClient, wallet};
 use indoc::indoc;
@@ -12,8 +13,8 @@ use std::convert::TryInto;
 use std::str::FromStr;
 use tokio::runtime::Runtime;
 use zcash_address::unified::{Container, Encoding, Ufvk};
-use zcash_client_backend::address::Address;
-use zcash_primitives::consensus::Parameters;
+use zcash_keys::address::Address;
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::components::amount::NonNegativeAmount;
 use zcash_primitives::transaction::fees::zip317::MINIMUM_FEE;
 
@@ -28,15 +29,17 @@ lazy_static! {
     static ref RT: Runtime = tokio::runtime::Runtime::new().unwrap();
 }
 
-/// TODO: Add Doc Comment Here!
+/// This command interface is used both by cli and also consumers.
 pub trait Command {
-    /// TODO: Add Doc Comment Here!
+    /// display command help (in cli)
     fn help(&self) -> &'static str;
 
-    /// TODO: Add Doc Comment Here!
+    /// TODO: Add Doc Comment for this!
     fn short_help(&self) -> &'static str;
 
-    /// TODO: Add Doc Comment Here!
+    /// in zingocli, this string is printed to console
+    /// consumers occasionally make assumptions about this
+    /// e. expect it to be a json object
     fn exec(&self, _args: &[&str], lightclient: &LightClient) -> String;
 }
 
@@ -134,16 +137,36 @@ impl Command for WalletKindCommand {
     fn exec(&self, _args: &[&str], lightclient: &LightClient) -> String {
         RT.block_on(async move {
             if lightclient.do_seed_phrase().await.is_ok() {
-                object! {"kind" => "Seeded"}.pretty(4)
-            } else {
-                let capability = lightclient.wallet.wallet_capability();
-                object! {
-                    "kind" => "Loaded from key",
-                    "transparent" => capability.transparent.kind_str(),
-                    "sapling" => capability.sapling.kind_str(),
-                    "orchard" => capability.orchard.kind_str(),
+                object! {"kind" => "Loaded from seed phrase",
+                        "transparent" => true,
+                        "sapling" => true,
+                        "orchard" => true,
                 }
                 .pretty(4)
+            } else {
+                match lightclient.wallet.wallet_capability().unified_key_store() {
+                    UnifiedKeyStore::Spend(_) => object! {
+                        "kind" => "Loaded from unified spending key",
+                        "transparent" => true,
+                        "sapling" => true,
+                        "orchard" => true,
+                    }
+                    .pretty(4),
+                    UnifiedKeyStore::View(ufvk) => object! {
+                        "kind" => "Loaded from unified full viewing key",
+                        "transparent" => ufvk.transparent().is_some(),
+                        "sapling" => ufvk.sapling().is_some(),
+                        "orchard" => ufvk.orchard().is_some(),
+                    }
+                    .pretty(4),
+                    UnifiedKeyStore::Empty => object! {
+                        "kind" => "No keys found",
+                        "transparent" => false,
+                        "sapling" => false,
+                        "orchard" => false,
+                    }
+                    .pretty(4),
+                }
             }
         })
     }
@@ -198,52 +221,65 @@ impl Command for ParseAddressCommand {
         match args.len() {
             1 => json::stringify_pretty(
                 [
-                    zingoconfig::ChainType::Mainnet,
-                    zingoconfig::ChainType::Testnet,
-                    zingoconfig::ChainType::Regtest(
-                        zingoconfig::RegtestNetwork::all_upgrades_active(),
+                    crate::config::ChainType::Mainnet,
+                    crate::config::ChainType::Testnet,
+                    crate::config::ChainType::Regtest(
+                        crate::config::RegtestNetwork::all_upgrades_active(),
                     ),
                 ]
                 .iter()
                 .find_map(|chain| Address::decode(chain, args[0]).zip(Some(chain)))
-                .map(|(recipient_address, chain_name)| {
-                    let chain_name_string = match chain_name {
-                        zingoconfig::ChainType::Mainnet => "main",
-                        zingoconfig::ChainType::Testnet => "test",
-                        zingoconfig::ChainType::Regtest(_) => "regtest",
-                    };
-
-                    match recipient_address {
-                        Address::Sapling(_) => object! {
-                            "status" => "success",
-                            "chain_name" => chain_name_string,
-                            "address_kind" => "sapling",
-                        },
-                        Address::Transparent(_) => object! {
-                            "status" => "success",
-                            "chain_name" => chain_name_string,
-                            "address_kind" => "transparent",
-                        },
-                        Address::Unified(ua) => {
-                            let mut receivers_available = vec![];
-                            if ua.orchard().is_some() {
-                                receivers_available.push("orchard")
-                            }
-                            if ua.sapling().is_some() {
-                                receivers_available.push("sapling")
-                            }
-                            if ua.transparent().is_some() {
-                                receivers_available.push("transparent")
-                            }
-                            object! {
+                .map_or(
+                    object! {
+                        "status" => "Invalid address",
+                        "chain_name" => json::JsonValue::Null,
+                        "address_kind" => json::JsonValue::Null,
+                    },
+                    |(recipient_address, chain_name)| {
+                        let chain_name_string = match chain_name {
+                            crate::config::ChainType::Mainnet => "main",
+                            crate::config::ChainType::Testnet => "test",
+                            crate::config::ChainType::Regtest(_) => "regtest",
+                        };
+                        match recipient_address {
+                            Address::Sapling(_) => object! {
                                 "status" => "success",
                                 "chain_name" => chain_name_string,
-                                "address_kind" => "unified",
-                                "receivers_available" => receivers_available,
+                                "address_kind" => "sapling",
+                            },
+                            Address::Transparent(_) => object! {
+                                "status" => "success",
+                                "chain_name" => chain_name_string,
+                                "address_kind" => "transparent",
+                            },
+                            Address::Unified(ua) => {
+                                let mut receivers_available = vec![];
+                                if ua.orchard().is_some() {
+                                    receivers_available.push("orchard")
+                                }
+                                if ua.sapling().is_some() {
+                                    receivers_available.push("sapling")
+                                }
+                                if ua.transparent().is_some() {
+                                    receivers_available.push("transparent")
+                                }
+                                object! {
+                                    "status" => "success",
+                                    "chain_name" => chain_name_string,
+                                    "address_kind" => "unified",
+                                    "receivers_available" => receivers_available,
+                                }
+                            }
+                            Address::Tex(_) => {
+                                object! {
+                                    "status" => "success",
+                                    "chain_name" => chain_name_string,
+                                    "address_kind" => "tex",
+                                }
                             }
                         }
-                    }
-                }),
+                    },
+                ),
                 4,
             ),
             _ => self.help().to_string(),
@@ -575,8 +611,30 @@ impl Command for UpdateCurrentPriceCommand {
     }
 }
 
+/// assumed by consumers to be JSON
 struct BalanceCommand {}
 impl Command for BalanceCommand {
+    fn help(&self) -> &'static str {
+        indoc! {r#"
+            Return the current ZEC balance in the wallet as a JSON object.
+
+            Transparent and Shielded balances, along with the addresses they belong to are displayed
+        "#}
+    }
+
+    fn short_help(&self) -> &'static str {
+        "Return the current ZEC balance in the wallet"
+    }
+
+    fn exec(&self, _args: &[&str], lightclient: &LightClient) -> String {
+        RT.block_on(async move {
+            serde_json::to_string_pretty(&lightclient.do_balance().await).unwrap()
+        })
+    }
+}
+
+struct PrintBalanceCommand {}
+impl Command for PrintBalanceCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
             Show the current ZEC balance in the wallet
@@ -592,15 +650,11 @@ impl Command for BalanceCommand {
     }
 
     fn exec(&self, _args: &[&str], lightclient: &LightClient) -> String {
-        RT.block_on(async move {
-            serde_json::to_string_pretty(&lightclient.do_balance().await).unwrap()
-        })
+        RT.block_on(async move { lightclient.do_balance().await.to_string() })
     }
 }
 
-#[cfg(feature = "zip317")]
 struct SpendableBalanceCommand {}
-#[cfg(feature = "zip317")]
 impl Command for SpendableBalanceCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
@@ -609,9 +663,13 @@ impl Command for SpendableBalanceCommand {
             the given address.
             An address must be specified as fees, and therefore spendable balance, depends on the receiver
             type.
+            zennies_for_zingo must also be specified as "true"|"false".  If set to "true" 1_000_000 ZAT will
+            earmarked to the zingolabs developer fund with each transaction.
 
             Usage:
             spendablebalance <address>
+            OR
+            spendablebalance { "address": "<address>", "zennies_for_zingo": <true|false> }
 
         "#}
     }
@@ -621,8 +679,8 @@ impl Command for SpendableBalanceCommand {
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        let address = match parse_spendable_balance_args(args, &lightclient.config.chain) {
-            Ok(addr) => addr,
+        let (address, zennies_for_zingo) = match parse_spendable_balance_args(args) {
+            Ok(address_and_zennies) => address_and_zennies,
             Err(e) => {
                 return format!(
                     "Error: {}\nTry 'help spendablebalance' for correct usage and examples.",
@@ -631,7 +689,10 @@ impl Command for SpendableBalanceCommand {
             }
         };
         RT.block_on(async move {
-            match lightclient.get_spendable_shielded_balance(address).await {
+            match lightclient
+                .get_spendable_shielded_balance(address, zennies_for_zingo)
+                .await
+            {
                 Ok(bal) => {
                     object! {
                         "balance" => bal.into_u64(),
@@ -685,18 +746,20 @@ impl Command for ExportUfvkCommand {
     }
 
     fn exec(&self, _args: &[&str], lightclient: &LightClient) -> String {
-        let ufvk_res = lightclient.wallet.transaction_context.key.ufvk();
-        match ufvk_res {
-            Ok(ufvk) => {
-                use zcash_address::unified::Encoding as _;
-                object! {
-                    "ufvk" => ufvk.encode(&lightclient.config().chain.network_type()),
-                    "birthday" => RT.block_on(lightclient.wallet.get_birthday())
-                }
-                .pretty(2)
-            }
-            Err(e) => format!("Error: {e}"),
+        let ufvk: UnifiedFullViewingKey = match lightclient
+            .wallet
+            .wallet_capability()
+            .unified_key_store()
+            .try_into()
+        {
+            Ok(ufvk) => ufvk,
+            Err(e) => return e.to_string(),
+        };
+        object! {
+            "ufvk" => ufvk.encode(&lightclient.config().chain),
+            "birthday" => RT.block_on(lightclient.wallet.get_birthday())
         }
+        .pretty(2)
     }
 }
 
@@ -806,101 +869,7 @@ impl Command for DecryptMessageCommand {
     }
 }
 
-#[cfg(not(feature = "zip317"))]
 struct SendCommand {}
-#[cfg(not(feature = "zip317"))]
-impl Command for SendCommand {
-    fn help(&self) -> &'static str {
-        indoc! {r#"
-            Send ZEC to the given address(es).
-            The 10_000 zat fee required to send this transaction is additionally deducted from your balance.
-            Usage:
-                send <address> <amount in zatoshis> "<optional memo>"
-                OR
-                send '[{"address":"<address>", "amount":<amount in zatoshis>, "memo":"<optional memo>"}, ...]'
-            Example:
-                send ztestsapling1x65nq4dgp0qfywgxcwk9n0fvm4fysmapgr2q00p85ju252h6l7mmxu2jg9cqqhtvzd69jwhgv8d 200000 "Hello from the command line"
-
-        "#}
-    }
-
-    fn short_help(&self) -> &'static str {
-        "Send ZEC to the given address(es)."
-    }
-
-    fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        let send_inputs = match utils::parse_send_args(args, &lightclient.config().chain) {
-            Ok(args) => args,
-            Err(e) => {
-                return format!(
-                    "Error: {}\nTry 'help send' for correct usage and examples.",
-                    e
-                )
-            }
-        };
-        RT.block_on(async move {
-            match lightclient.do_send(send_inputs).await {
-                Ok(txid) => {
-                    object! { "txid" => txid.to_string() }
-                }
-                Err(e) => {
-                    object! { "error" => e }
-                }
-            }
-            .pretty(2)
-        })
-    }
-}
-
-#[cfg(not(feature = "zip317"))]
-struct ShieldCommand {}
-#[cfg(not(feature = "zip317"))]
-impl Command for ShieldCommand {
-    fn help(&self) -> &'static str {
-        indoc! {r#"
-            Shield all your transparent and/or sapling funds
-            Usage:
-            shield ['transparent' or 'sapling' or 'all'] [optional address]
-
-            NOTE: The fee required to send this transaction (currently ZEC 0.0001) is additionally deducted from your balance.
-            Example:
-            shield all
-
-        "#}
-    }
-
-    fn short_help(&self) -> &'static str {
-        "Shield your transparent and/or sapling ZEC into the orchard pool"
-    }
-
-    fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        let (pools_to_shield, address) =
-            match utils::parse_shield_args(args, &lightclient.config().chain) {
-                Ok(args) => args,
-                Err(e) => {
-                    return format!(
-                        "Error: {}\nTry 'help shield' for correct usage and examples.",
-                        e
-                    )
-                }
-            };
-        RT.block_on(async move {
-            match lightclient.do_shield(&pools_to_shield, address).await {
-                Ok(txid) => {
-                    object! { "txid" => txid.to_string() }
-                }
-                Err(e) => {
-                    object! { "error" => e }
-                }
-            }
-            .pretty(2)
-        })
-    }
-}
-
-#[cfg(feature = "zip317")]
-struct SendCommand {}
-#[cfg(feature = "zip317")]
 impl Command for SendCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
@@ -924,7 +893,7 @@ impl Command for SendCommand {
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        let receivers = match utils::parse_send_args(args, &lightclient.config().chain) {
+        let receivers = match utils::parse_send_args(args) {
             Ok(receivers) => receivers,
             Err(e) => {
                 return format!(
@@ -960,22 +929,22 @@ impl Command for SendCommand {
     }
 }
 
-#[cfg(feature = "zip317")]
 struct SendAllCommand {}
-#[cfg(feature = "zip317")]
 impl Command for SendAllCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
             Propose to transfer all ZEC from shielded pools to a given address.
             The fee required to send this transaction will be added to the proposal and displayed to the user.
             The 'confirm' command must be called to complete and broadcast the proposed transaction(s).
+            If invoked with a JSON arg "zennies_for_zingo" must be specified, if set to 'true' 1_000_000 ZAT
+            will be sent to the zingolabs developer address with each transaction.
 
             Warning:
                 Does not send transparent funds. These funds must be shielded first. Type `help shield` for more information.
             Usage:
                 sendall <address> "<optional memo>"
                 OR
-                sendall '[{"address":"<address>", "memo":"<optional memo>"}]'
+                sendall '{ "address": "<address>", "memo": "<optional memo>", "zennies_for_zingo": <true|false> }'
             Example:
                 sendall ztestsapling1x65nq4dgp0qfywgxcwk9n0fvm4fysmapgr2q00p85ju252h6l7mmxu2jg9cqqhtvzd69jwhgv8d "Sending all funds"
                 confirm
@@ -988,8 +957,8 @@ impl Command for SendAllCommand {
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        let (address, memo) = match utils::parse_send_all_args(args, &lightclient.config().chain) {
-            Ok(args) => args,
+        let (address, zennies_for_zingo, memo) = match utils::parse_send_all_args(args) {
+            Ok(parse_results) => parse_results,
             Err(e) => {
                 return format!(
                     "Error: {}\nTry 'help sendall' for correct usage and examples.",
@@ -998,7 +967,10 @@ impl Command for SendAllCommand {
             }
         };
         RT.block_on(async move {
-            match lightclient.propose_send_all(address, memo).await {
+            match lightclient
+                .propose_send_all(address, zennies_for_zingo, memo)
+                .await
+            {
                 Ok(proposal) => {
                     let amount = match proposal::total_payment_amount(&proposal) {
                         Ok(amount) => amount,
@@ -1022,9 +994,7 @@ impl Command for SendAllCommand {
     }
 }
 
-#[cfg(feature = "zip317")]
 struct QuickSendCommand {}
-#[cfg(feature = "zip317")]
 impl Command for QuickSendCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
@@ -1047,7 +1017,7 @@ impl Command for QuickSendCommand {
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        let receivers = match utils::parse_send_args(args, &lightclient.config().chain) {
+        let receivers = match utils::parse_send_args(args) {
             Ok(receivers) => receivers,
             Err(e) => {
                 return format!(
@@ -1079,9 +1049,7 @@ impl Command for QuickSendCommand {
     }
 }
 
-#[cfg(feature = "zip317")]
 struct ShieldCommand {}
-#[cfg(feature = "zip317")]
 impl Command for ShieldCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
@@ -1140,9 +1108,7 @@ impl Command for ShieldCommand {
     }
 }
 
-#[cfg(feature = "zip317")]
 struct QuickShieldCommand {}
-#[cfg(feature = "zip317")]
 impl Command for QuickShieldCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
@@ -1184,9 +1150,7 @@ impl Command for QuickShieldCommand {
     }
 }
 
-#[cfg(feature = "zip317")]
 struct ConfirmCommand {}
-#[cfg(feature = "zip317")]
 impl Command for ConfirmCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
@@ -1297,55 +1261,78 @@ impl Command for SeedCommand {
     }
 }
 
-#[cfg(feature = "lightclient-deprecated")]
-struct TransactionsCommand {}
-#[cfg(feature = "lightclient-deprecated")]
-impl Command for TransactionsCommand {
+struct ValueTransfersCommand {}
+impl Command for ValueTransfersCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
-            List all incoming and outgoing transactions from this wallet
+            List all value transfers for this wallet.
+            A value transfer is a group of all notes to a specific receiver in a transaction.
+
             Usage:
-            list [allmemos]
-
-            If you include the 'allmemos' argument, all memos are returned in their raw hex format
-
+            valuetransfers
         "#}
     }
 
     fn short_help(&self) -> &'static str {
-        "List all transactions in the wallet"
+        "List all value transfers for this wallet."
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        if args.len() > 1 {
-            return format!("Didn't understand arguments\n{}", self.help());
+        if !args.is_empty() {
+            return "Error: invalid arguments\nTry 'help valuetransfers' for correct usage and examples"
+                .to_string();
         }
 
-        RT.block_on(async move { lightclient.do_list_transactions().await.pretty(2) })
+        RT.block_on(async move { format!("{}", lightclient.value_transfers().await) })
     }
 }
 
-struct ValueTxSummariesCommand {}
-impl Command for ValueTxSummariesCommand {
+struct TransactionsCommand {}
+impl Command for TransactionsCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
-            List summaries of value transfers for this seed.
+            Provides a list of transaction summaries related to this wallet in order of blockheight.
+
             Usage:
-            summaries
+            transactions
         "#}
     }
 
     fn short_help(&self) -> &'static str {
-        "List all value transfer summaries for this seed."
+        "Provides a list of transaction summaries related to this wallet in order of blockheight."
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
-        if args.len() > 1 {
-            return format!("Didn't understand arguments\n{}", self.help());
+        if !args.is_empty() {
+            return "Error: invalid arguments\nTry 'help transactions' for correct usage and examples"
+                .to_string();
         }
+        RT.block_on(async move { format!("{}", lightclient.transaction_summaries().await) })
+    }
+}
 
+struct DetailedTransactionsCommand {}
+impl Command for DetailedTransactionsCommand {
+    fn help(&self) -> &'static str {
+        indoc! {r#"
+            Provides a detailed list of transaction summaries related to this wallet in order of blockheight.
+
+            Usage:
+            detailed_transactions
+        "#}
+    }
+
+    fn short_help(&self) -> &'static str {
+        "Provides a detailed list of transaction summaries related to this wallet in order of blockheight."
+    }
+
+    fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
+        if !args.is_empty() {
+            return "Error: invalid arguments\nTry 'help detailed_transactions' for correct usage and examples"
+                .to_string();
+        }
         RT.block_on(
-            async move { json::JsonValue::from(lightclient.list_txsummaries().await).pretty(2) },
+            async move { format!("{}", lightclient.detailed_transaction_summaries().await) },
         )
     }
 }
@@ -1655,17 +1642,17 @@ struct NotesCommand {}
 impl Command for NotesCommand {
     fn help(&self) -> &'static str {
         indoc! {r#"
-            Show all sapling notes and utxos in this wallet
+            Show all shielded notes and transparent coins in this wallet
             Usage:
             notes [all]
 
-            If you supply the "all" parameter, all previously spent sapling notes and spent utxos are also included
+            If you supply the "all" parameter, all previously spent shielded notes and transparent coins are also included
 
         "#}
     }
 
     fn short_help(&self) -> &'static str {
-        "List all sapling notes and utxos in the wallet"
+        "Show all shielded notes and transparent coins in this wallet"
     }
 
     fn exec(&self, args: &[&str], lightclient: &LightClient) -> String {
@@ -1786,11 +1773,17 @@ pub fn get_commands() -> HashMap<&'static str, Box<dyn Command>> {
         ("clear", Box::new(ClearCommand {})),
         ("help", Box::new(HelpCommand {})),
         ("balance", Box::new(BalanceCommand {})),
+        ("print_balance", Box::new(PrintBalanceCommand {})),
         ("addresses", Box::new(AddressCommand {})),
         ("height", Box::new(HeightCommand {})),
         ("sendprogress", Box::new(SendProgressCommand {})),
         ("setoption", Box::new(SetOptionCommand {})),
-        ("summaries", Box::new(ValueTxSummariesCommand {})),
+        ("valuetransfers", Box::new(ValueTransfersCommand {})),
+        ("transactions", Box::new(TransactionsCommand {})),
+        (
+            "detailed_transactions",
+            Box::new(DetailedTransactionsCommand {}),
+        ),
         ("value_to_address", Box::new(ValueToAddressCommand {})),
         ("sends_to_address", Box::new(SendsToAddressCommand {})),
         (
@@ -1813,11 +1806,6 @@ pub fn get_commands() -> HashMap<&'static str, Box<dyn Command>> {
         ("wallet_kind", Box::new(WalletKindCommand {})),
         ("delete", Box::new(DeleteCommand {})),
     ];
-    #[cfg(feature = "lightclient-deprecated")]
-    {
-        entries.push(("list", Box::new(TransactionsCommand {})));
-    }
-    #[cfg(feature = "zip317")]
     {
         entries.push(("spendablebalance", Box::new(SpendableBalanceCommand {})));
         entries.push(("sendall", Box::new(SendAllCommand {})));

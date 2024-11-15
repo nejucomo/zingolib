@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `TxMapAndMaybeTrees` renamed `TxMap`
+
+### Removed
+
+- `lightclient.bsync_data.uri()`
+
+## [mobile-release-1.4.3-0-g9fa99407]
+
 ### Deprecated
 
 - `lightclient::LightClient::do_list_transactions`
@@ -46,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `lightclient::LightClient`:
   - `do_send` inputs from `Vec<(&str, u64, Option<MemoBytes>)>` to `Vec<(Address, NonNegativeAmount, Option<MemoBytes>)>`
   - `do_shield` inputs from `Option<String>` to `Option<Address>`
-  - `do_list_txsummaries` --> `list_txsummaries`
+  - `do_list_txsummaries` --> `list_value_transfers`
 
 - `TxMapAndMaybeTrees::A --> TransactionRecordsById::A` where A:
   - add_new_note<D>
@@ -61,8 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `load_clientconfig` moved to zingoconfig crate
 - `lightclient::LightClient`:
   - `do_save`
+  - `do_send`
+  - `do_shield`
   - `do_save_to_buffer`
   - `do_save_to_buffer_sync`
   - `fix_spent_at_height`
   - `TransactionRecord::net_spent`
   - `TransactionRecord::get_transparent_value_spent()`
+- `LightWallet`:
+  - `send_to_addresses`

@@ -12,14 +12,13 @@ use zcash_primitives::{
     memo::{Memo, MemoBytes},
 };
 
-use zingoconfig::ZingoConfig;
+use crate::config::ZingoConfig;
 
 use crate::{
     blaze::syncdata::BlazeSyncData,
     wallet::{keys::unified::ReceiverSelection, message::Message, LightWallet, SendProgress},
 };
 
-#[cfg(feature = "zip317")]
 use crate::data::proposal::ZingoProposal;
 
 /// TODO: Add Doc Comment Here!
@@ -90,13 +89,18 @@ pub struct LightWalletSendProgress {
 impl LightWalletSendProgress {
     /// TODO: Add Doc Comment Here!
     pub fn to_json(&self) -> JsonValue {
+        let last_result = self.progress.last_result.clone();
+        let txids: Option<String> = last_result
+            .clone()
+            .and_then(|result| result.ok().map(|json_result| json_result.to_string()));
+        let error: Option<String> = last_result.and_then(|result| result.err());
         object! {
             "id" => self.progress.id,
             "sending" => self.progress.is_send_in_progress,
             "progress" => self.progress.progress,
             "total" => self.progress.total,
-            "txid" => self.progress.last_transaction_id.clone(),
-            "error" => self.progress.last_error.clone(),
+            "txids" => txids,
+            "error" => error,
             "sync_interrupt" => self.interrupt_sync
         }
     }
@@ -125,6 +129,63 @@ pub struct PoolBalances {
 
     /// TODO: Add Doc Comment Here!
     pub transparent_balance: Option<u64>,
+}
+fn format_option_zatoshis(ioz: &Option<u64>) -> String {
+    ioz.map(|ioz_num| {
+        if ioz_num == 0 {
+            "0".to_string()
+        } else {
+            let mut digits = vec![];
+            let mut remainder = ioz_num;
+            while remainder != 0 {
+                digits.push(remainder % 10);
+                remainder /= 10;
+            }
+            let mut backwards = "".to_string();
+            for (i, digit) in digits.iter().enumerate() {
+                if i % 8 == 4 {
+                    backwards.push('_');
+                }
+                if let Some(ch) = char::from_digit(*digit as u32, 10) {
+                    backwards.push(ch);
+                }
+                if i == 7 {
+                    backwards.push('.');
+                }
+            }
+            backwards.chars().rev().collect::<String>()
+        }
+    })
+    .unwrap_or("null".to_string())
+}
+impl std::fmt::Display for PoolBalances {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[
+    sapling_balance: {}
+    verified_sapling_balance: {}
+    spendable_sapling_balance: {}
+    unverified_sapling_balance: {}
+
+    orchard_balance: {}
+    verified_orchard_balance: {}
+    spendable_orchard_balance: {}
+    unverified_orchard_balance: {}
+
+    transparent_balance: {}
+]",
+            format_option_zatoshis(&self.sapling_balance),
+            format_option_zatoshis(&self.verified_sapling_balance),
+            format_option_zatoshis(&self.spendable_sapling_balance),
+            format_option_zatoshis(&self.unverified_sapling_balance),
+            format_option_zatoshis(&self.orchard_balance),
+            format_option_zatoshis(&self.verified_orchard_balance),
+            format_option_zatoshis(&self.spendable_orchard_balance),
+            format_option_zatoshis(&self.unverified_orchard_balance),
+            format_option_zatoshis(&self.transparent_balance),
+        )
+    }
 }
 
 /// TODO: Add Doc Comment Here!
@@ -215,7 +276,7 @@ pub struct UserBalances {
     pub incoming_dust: u64,
 }
 
-/// The LightClient provides a unified interface to the separate concerns that the zingolib library manages.
+/// The LightClient connects one LightWallet to one lightwalletd server via gRPC.
 ///  1. initialization of stored state
 ///      * from seed
 ///      * from keys
@@ -224,6 +285,8 @@ pub struct UserBalances {
 ///  2. synchronization of the client with the state of the blockchain via a gRPC server
 ///      *
 pub struct LightClient {
+    // / the LightClient connects to one server.
+    // pub(crate) server_uri: Arc<RwLock<Uri>>,
     pub(crate) config: ZingoConfig,
     /// TODO: Add Doc Comment Here!
     pub wallet: LightWallet,
@@ -235,13 +298,12 @@ pub struct LightClient {
     bsync_data: Arc<RwLock<BlazeSyncData>>,
     interrupt_sync: Arc<RwLock<bool>>,
 
-    #[cfg(feature = "zip317")]
     latest_proposal: Arc<RwLock<Option<ZingoProposal>>>,
 
     save_buffer: ZingoSaveBuffer,
 }
 
-///  This is the omnibus interface to the library, we are currently in the process of refining this typez broad definition!
+/// all the wonderfully intertwined ways to conjure a LightClient
 pub mod instantiation {
     use log::debug;
     use std::{
@@ -253,7 +315,7 @@ pub mod instantiation {
         sync::{Mutex, RwLock},
     };
 
-    use zingoconfig::ZingoConfig;
+    use crate::config::ZingoConfig;
 
     use super::{LightClient, ZingoSaveBuffer};
     use crate::{
@@ -265,20 +327,17 @@ pub mod instantiation {
         // toDo rework ZingoConfig.
 
         /// This is the fundamental invocation of a LightClient. It lives in an asyncronous runtime.
-        pub async fn create_from_wallet_async(
-            wallet: LightWallet,
-            config: ZingoConfig,
-        ) -> io::Result<Self> {
+        pub async fn create_from_wallet_async(wallet: LightWallet) -> io::Result<Self> {
             let mut buffer: Vec<u8> = vec![];
             wallet.write(&mut buffer).await?;
+            let config = wallet.transaction_context.config.clone();
             Ok(LightClient {
                 wallet,
                 config: config.clone(),
                 mempool_monitor: std::sync::RwLock::new(None),
                 sync_lock: Mutex::new(()),
-                bsync_data: Arc::new(RwLock::new(BlazeSyncData::new(&config))),
+                bsync_data: Arc::new(RwLock::new(BlazeSyncData::new())),
                 interrupt_sync: Arc::new(RwLock::new(false)),
-                #[cfg(feature = "zip317")]
                 latest_proposal: Arc::new(RwLock::new(None)),
                 save_buffer: ZingoSaveBuffer::new(buffer),
             })
@@ -319,10 +378,11 @@ pub mod instantiation {
                 ));
                 }
             }
-            let lightclient = LightClient::create_from_wallet_async(
-                LightWallet::new(config.clone(), wallet_base, birthday)?,
+            let lightclient = LightClient::create_from_wallet_async(LightWallet::new(
                 config.clone(),
-            )
+                wallet_base,
+                birthday,
+            )?)
             .await?;
 
             lightclient.set_wallet_initial_state(birthday).await;
@@ -342,10 +402,11 @@ pub mod instantiation {
             wallet_base: WalletBase,
             height: u64,
         ) -> io::Result<Self> {
-            let lightclient = LightClient::create_from_wallet_async(
-                LightWallet::new(config.clone(), wallet_base, height)?,
+            let lightclient = LightClient::create_from_wallet_async(LightWallet::new(
                 config.clone(),
-            )
+                wallet_base,
+                height,
+            )?)
             .await?;
             Ok(lightclient)
         }
@@ -396,7 +457,6 @@ pub mod sync;
 
 pub mod send;
 
-#[cfg(feature = "zip317")]
 pub mod propose;
 
 // other functions
@@ -473,7 +533,7 @@ impl LightClient {
         let new_address = self
             .wallet
             .wallet_capability()
-            .new_address(desired_receivers)?;
+            .new_address(desired_receivers, false)?;
 
         // self.save_internal_rust().await?;
 
@@ -513,19 +573,23 @@ impl LightClient {
         }
     }
 
+    /// This function sorts notes into
+    /// unspent
+    /// spend_is_pending
+    /// spend_is_confirmed
     fn unspent_pending_spent(
         &self,
         note: JsonValue,
         unspent: &mut Vec<JsonValue>,
-        pending: &mut Vec<JsonValue>,
-        spent: &mut Vec<JsonValue>,
+        spend_is_pending: &mut Vec<JsonValue>,
+        spend_is_confirmed: &mut Vec<JsonValue>,
     ) {
         if note["spent"].is_null() && note["pending_spent"].is_null() {
             unspent.push(note);
         } else if !note["spent"].is_null() {
-            spent.push(note);
+            spend_is_confirmed.push(note);
         } else {
-            pending.push(note);
+            spend_is_pending.push(note);
         }
     }
 }
@@ -630,9 +694,9 @@ async fn get_recent_median_price_from_gemini() -> Result<f64, PriceFetchError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{ChainType, RegtestNetwork, ZingoConfig};
+    use crate::testvectors::seeds::CHIMNEY_BETTER_SEED;
     use tokio::runtime::Runtime;
-    use zingo_testvectors::seeds::CHIMNEY_BETTER_SEED;
-    use zingoconfig::{ChainType, RegtestNetwork, ZingoConfig};
 
     use crate::{lightclient::LightClient, wallet::WalletBase};
 

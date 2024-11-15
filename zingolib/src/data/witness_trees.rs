@@ -19,7 +19,7 @@ use zcash_note_encryption::Domain;
 use zcash_primitives::consensus::BlockHeight;
 use zcash_primitives::merkle_tree::HashSer;
 
-use zingoconfig::MAX_REORG;
+use crate::config::MAX_REORG;
 
 /// TODO: Add Doc Comment Here!
 pub const COMMITMENT_TREE_LEVELS: u8 = 32;
@@ -149,9 +149,14 @@ impl Default for WitnessTrees {
 }
 
 impl WitnessTrees {
-    pub(crate) fn add_checkpoint(&mut self, height: BlockHeight) {
-        self.witness_tree_sapling.checkpoint(height).unwrap();
-        self.witness_tree_orchard.checkpoint(height).unwrap();
+    /// helper truncates shard trees for both shielded pools
+    pub(crate) fn truncate_to_checkpoint(&mut self, checkpoint_height: BlockHeight) {
+        self.witness_tree_sapling
+            .truncate_to_checkpoint(&checkpoint_height)
+            .expect("Infallible");
+        self.witness_tree_orchard
+            .truncate_to_checkpoint(&checkpoint_height)
+            .expect("Infallible");
     }
 
     const VERSION: u8 = 0;

@@ -1,6 +1,7 @@
 //! The lookup for transaction id indexed data.  Currently this provides the
 //! transaction record.
 
+use crate::wallet::notes::{interface::OutputConstructor, TransparentOutput};
 use crate::wallet::{
     error::FeeError,
     notes::{
@@ -9,7 +10,7 @@ use crate::wallet::{
         OrchardNote, OutputInterface, SaplingNote,
     },
     traits::{DomainWalletExt, Recipient},
-    transaction_record::TransactionRecord,
+    transaction_record::{SendType, TransactionKind, TransactionRecord},
 };
 use std::collections::HashMap;
 
@@ -19,7 +20,12 @@ use sapling_crypto::note_encryption::SaplingDomain;
 use zcash_client_backend::wallet::NoteId;
 use zcash_note_encryption::Domain;
 use zcash_primitives::consensus::BlockHeight;
+use zingo_status::confirmation_status::ConfirmationStatus;
 
+use crate::config::{
+    ChainType, ZENNIES_FOR_ZINGO_DONATION_ADDRESS, ZENNIES_FOR_ZINGO_REGTEST_ADDRESS,
+    ZENNIES_FOR_ZINGO_TESTNET_ADDRESS,
+};
 use zcash_primitives::transaction::TxId;
 
 pub mod trait_inputsource;
@@ -58,17 +64,9 @@ impl TransactionRecordsById {
 impl TransactionRecordsById {
     /// Uses a query to select all notes across all transactions with specific properties and sum them
     pub fn query_sum_value(&self, include_notes: OutputQuery) -> u64 {
-        self.0.iter().fold(0, |partial_sum, transaction_record| {
-            partial_sum + transaction_record.1.query_sum_value(include_notes)
+        self.0.iter().fold(0, |partial_sum, (_id, record)| {
+            partial_sum + record.query_sum_value(include_notes)
         })
-    }
-
-    /// Uses a query to select all notes across all transactions with specific properties and sum them
-    pub fn query_for_ids(&self, include_notes: OutputQuery) -> Vec<crate::wallet::notes::OutputId> {
-        self.0
-            .iter()
-            .flat_map(|transaction_record| transaction_record.1.query_for_ids(include_notes))
-            .collect()
     }
 
     /// TODO: Add Doc Comment Here!
@@ -88,7 +86,7 @@ impl TransactionRecordsById {
         let transaction = self.get(note_id.txid());
         if note_id.protocol() == D::SHIELDED_PROTOCOL {
             transaction.and_then(|transaction_record| {
-                D::WalletNote::transaction_record_to_outputs_vec(transaction_record)
+                D::WalletNote::get_record_outputs(transaction_record)
                     .iter()
                     .find(|note| note.output_index() == &Some(note_id.output_index() as u32))
                     .and_then(|note| {
@@ -116,7 +114,7 @@ impl TransactionRecordsById {
     pub fn insert_transaction_record(&mut self, transaction_record: TransactionRecord) {
         self.insert(transaction_record.txid, transaction_record);
     }
-    /// Invalidates all transactions from a given height including the block with block height `reorg_height`
+    /// Invalidates all transactions from a given height including the block with block height `reorg_height`.
     ///
     /// All information above a certain height is invalidated during a reorg.
     pub fn invalidate_all_transactions_after_or_at_height(&mut self, reorg_height: BlockHeight) {
@@ -124,12 +122,8 @@ impl TransactionRecordsById {
         let txids_to_remove = self
             .values()
             .filter_map(|transaction_metadata| {
-                if transaction_metadata
-                    .status
-                    .is_confirmed_after_or_at(&reorg_height)
-                    || transaction_metadata
-                        .status
-                        .is_pending_after_or_at(&reorg_height)
+                // doesnt matter the status: if it happen after a reorg, eliminate it
+                if transaction_metadata.status.get_height() >= reorg_height
                 // TODO: why dont we only remove confirmed transactions. pending transactions may still be valid in the mempool and may later confirm or expire.
                 {
                     Some(transaction_metadata.txid)
@@ -167,14 +161,13 @@ impl TransactionRecordsById {
                 .transparent_outputs
                 .iter_mut()
                 .for_each(|utxo| {
-                    if utxo.is_spent() && invalidated_txids.contains(&utxo.spent().unwrap().0) {
-                        *utxo.spent_mut() = None;
-                    }
-
-                    if utxo.pending_spent.is_some()
-                        && invalidated_txids.contains(&utxo.pending_spent.unwrap().0)
+                    // Mark utxo as unspent if the txid being removed spent it.
+                    if utxo
+                        .spending_tx_status()
+                        .filter(|(txid, _status)| invalidated_txids.contains(txid))
+                        .is_some()
                     {
-                        utxo.pending_spent = None;
+                        *utxo.spending_tx_status_mut() = None;
                     }
                 })
         });
@@ -190,126 +183,229 @@ impl TransactionRecordsById {
         self.values_mut().for_each(|transaction_metadata| {
             // Update notes to rollback any spent notes
             // Select only spent or pending_spent notes.
-            D::WalletNote::transaction_record_to_outputs_vec_query_mut(
+            D::WalletNote::get_record_query_matching_outputs_mut(
                 transaction_metadata,
                 OutputSpendStatusQuery::spentish(),
             )
             .iter_mut()
-            .for_each(|nd| {
+            .for_each(|note| {
                 // Mark note as unspent if the txid being removed spent it.
-                if nd.spent().is_some() && invalidated_txids.contains(&nd.spent().unwrap().0) {
-                    *nd.spent_mut() = None;
-                }
-
-                // Remove pending spends too
-                if nd.pending_spent().is_some()
-                    && invalidated_txids.contains(&nd.pending_spent().unwrap().0)
+                if note
+                    .spending_tx_status()
+                    .filter(|(txid, _status)| invalidated_txids.contains(txid))
+                    .is_some()
                 {
-                    *nd.pending_spent_mut() = None;
+                    *note.spending_tx_status_mut() = None;
                 }
             });
         });
     }
 
-    fn get_sapling_notes_spent_in_tx(
-        &self,
-        query: &TransactionRecord,
-    ) -> Result<Vec<&SaplingNote>, FeeError> {
-        query
-            .spent_sapling_nullifiers()
-            .iter()
-            .map(|nullifier| {
-                self.values()
-                    .flat_map(|wallet_transaction_record| wallet_transaction_record.sapling_notes())
-                    .find(|&note| {
-                        if let Some(nf) = note.nullifier() {
-                            nf == *nullifier
-                        } else {
-                            false
-                        }
-                    })
-                    .ok_or(FeeError::SaplingSpendNotFound(*nullifier))
+    /// Finds orchard note with given nullifier and updates its spend status
+    /// Currently only used for updating through pending statuses
+    /// For marking spent see [`crate::wallet::tx_map::TxMap::mark_note_as_spent`]i
+    // TODO: verify there is logic to mark pending notes back to unspent during invalidation
+    fn update_orchard_note_spend_status(
+        &mut self,
+        nullifier: &orchard::note::Nullifier,
+        spend_status: Option<(TxId, ConfirmationStatus)>,
+    ) {
+        let source_txid = self
+            .values()
+            .find(|tx| {
+                tx.orchard_notes()
+                    .iter()
+                    .flat_map(|note| note.nullifier)
+                    .any(|nf| nf == *nullifier)
             })
-            .collect::<Result<Vec<&SaplingNote>, FeeError>>()
-    }
-    fn get_orchard_notes_spent_in_tx(
-        &self,
-        query: &TransactionRecord,
-    ) -> Result<Vec<&OrchardNote>, FeeError> {
-        query
-            .spent_orchard_nullifiers()
-            .iter()
-            .map(|nullifier| {
-                self.values()
-                    .flat_map(|wallet_transaction_record| wallet_transaction_record.orchard_notes())
-                    .find(|&note| {
-                        if let Some(nf) = note.nullifier() {
-                            nf == *nullifier
-                        } else {
-                            false
-                        }
-                    })
-                    .ok_or(FeeError::OrchardSpendNotFound(*nullifier))
-            })
-            .collect::<Result<Vec<&OrchardNote>, FeeError>>()
-    }
-    /// Note this method is INCORRECT in the case of a 0-value, 0-fee transaction from the
-    /// Creating Capability.  Such a transaction would violate ZIP317, but could exist in
-    /// the Zcash protocol
-    ///  TODO:   Test and handle 0-value, 0-fee transaction
-    pub(crate) fn transaction_is_received(
-        &self,
-        query_record: &TransactionRecord,
-    ) -> Result<bool, FeeError> {
-        match self.total_value_input_to_transaction(query_record) {
-            Ok(amount) => {
-                if amount == 0 && query_record.outgoing_tx_data.is_empty() {
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            Err(fee_error) => Err(fee_error),
+            .map(|tx| tx.txid);
+
+        if let Some(txid) = source_txid {
+            let source_tx = self.get_mut(&txid).expect("transaction should exist");
+            *source_tx
+                .orchard_notes
+                .iter_mut()
+                .find(|note| {
+                    if let Some(nf) = note.nullifier() {
+                        nf == *nullifier
+                    } else {
+                        false
+                    }
+                })
+                .expect("spend must exist")
+                .spending_tx_status_mut() = spend_status;
         }
     }
+    /// Finds sapling note with given nullifier and updates its spend status
+    /// Currently only used for updating through pending statuses
+    /// For marking spent see [`crate::wallet::tx_map::TxMap::mark_note_as_spent`]i
+    // TODO: verify there is logic to mark pending notes back to unspent during invalidation
+    fn update_sapling_note_spend_status(
+        &mut self,
+        nullifier: &sapling_crypto::Nullifier,
+        spend_status: Option<(TxId, ConfirmationStatus)>,
+    ) {
+        let source_txid = self
+            .values()
+            .find(|tx| {
+                tx.sapling_notes()
+                    .iter()
+                    .flat_map(|note| note.nullifier)
+                    .any(|nf| nf == *nullifier)
+            })
+            .map(|tx| tx.txid);
+
+        if let Some(txid) = source_txid {
+            let source_tx = self.get_mut(&txid).expect("transaction should exist");
+            *source_tx
+                .sapling_notes
+                .iter_mut()
+                .find(|note| {
+                    if let Some(nf) = note.nullifier() {
+                        nf == *nullifier
+                    } else {
+                        false
+                    }
+                })
+                .expect("spend must exist")
+                .spending_tx_status_mut() = spend_status;
+        }
+    }
+
+    /// Updates notes spent in spending transaction to the given spend status
+    ///
+    /// Panics if spending transaction doesn't exist in wallet data, intended to be called after `scan_full_tx`
+    pub(crate) fn update_note_spend_statuses(
+        &mut self,
+        spending_txid: TxId,
+        spend_status: Option<(TxId, ConfirmationStatus)>,
+    ) {
+        if let Some(spending_tx) = self.get(&spending_txid) {
+            let orchard_nullifiers = spending_tx.spent_orchard_nullifiers.clone();
+            let sapling_nullifiers = spending_tx.spent_sapling_nullifiers.clone();
+
+            orchard_nullifiers
+                .iter()
+                .for_each(|nf| self.update_orchard_note_spend_status(nf, spend_status));
+            sapling_nullifiers
+                .iter()
+                .for_each(|nf| self.update_sapling_note_spend_status(nf, spend_status));
+        }
+    }
+
+    fn find_sapling_spend(&self, nullifier: &sapling_crypto::Nullifier) -> Option<&SaplingNote> {
+        self.values()
+            .flat_map(|wallet_transaction_record| wallet_transaction_record.sapling_notes())
+            .find(|&note| {
+                if let Some(nf) = note.nullifier() {
+                    nf == *nullifier
+                } else {
+                    false
+                }
+            })
+    }
+    fn find_orchard_spend(&self, nullifier: &orchard::note::Nullifier) -> Option<&OrchardNote> {
+        self.values()
+            .flat_map(|wallet_transaction_record| wallet_transaction_record.orchard_notes())
+            .find(|&note| {
+                if let Some(nf) = note.nullifier() {
+                    nf == *nullifier
+                } else {
+                    false
+                }
+            })
+    }
+    // returns all sapling notes spent in a given transaction.
+    // will fail if a spend is not found when `fail_on_miss` is set to true.
+    fn get_sapling_notes_spent_in_tx(
+        &self,
+        query_record: &TransactionRecord,
+        fail_on_miss: bool,
+    ) -> Result<Vec<&SaplingNote>, FeeError> {
+        let mut sapling_spends: Vec<&SaplingNote> =
+            Vec::with_capacity(query_record.spent_sapling_nullifiers.len());
+
+        for nullifier in query_record.spent_sapling_nullifiers() {
+            if let Some(spend) = self.find_sapling_spend(nullifier) {
+                sapling_spends.push(spend);
+            } else if fail_on_miss {
+                return Err(FeeError::SaplingSpendNotFound(*nullifier));
+            }
+        }
+        Ok(sapling_spends)
+    }
+    // returns all orchard notes spent in a given transaction.
+    // will fail if a spend is not found when `fail_on_miss` is set to true.
+    fn get_orchard_notes_spent_in_tx(
+        &self,
+        query_record: &TransactionRecord,
+        fail_on_miss: bool,
+    ) -> Result<Vec<&OrchardNote>, FeeError> {
+        let mut orchard_spends: Vec<&OrchardNote> =
+            Vec::with_capacity(query_record.spent_orchard_nullifiers.len());
+
+        for nullifier in query_record.spent_orchard_nullifiers() {
+            if let Some(spend) = self.find_orchard_spend(nullifier) {
+                orchard_spends.push(spend);
+            } else if fail_on_miss {
+                return Err(FeeError::OrchardSpendNotFound(*nullifier));
+            }
+        }
+        Ok(orchard_spends)
+    }
+
+    // returns total sum of spends for a given transaction.
+    // will fail if a spend is not found in the wallet
     fn total_value_input_to_transaction(
         &self,
         query_record: &TransactionRecord,
     ) -> Result<u64, FeeError> {
-        let sapling_spend_value: u64 = self
-            .get_sapling_notes_spent_in_tx(query_record)?
+        let transparent_spends = self.get_transparent_coins_spent_in_tx(query_record);
+        let sapling_spends = self.get_sapling_notes_spent_in_tx(query_record, true)?;
+        let orchard_spends = self.get_orchard_notes_spent_in_tx(query_record, true)?;
+
+        if sapling_spends.is_empty() && orchard_spends.is_empty() && transparent_spends.is_empty() {
+            if query_record.outgoing_tx_data.is_empty() {
+                return Err(FeeError::ReceivedTransaction);
+            } else {
+                return Err(FeeError::OutgoingWithoutSpends(
+                    query_record.outgoing_tx_data.to_vec(),
+                ));
+            }
+        }
+
+        let transparent_spend_value = transparent_spends
             .iter()
-            .map(|&note| note.value())
-            .sum();
-        let orchard_spend_value: u64 = self
-            .get_orchard_notes_spent_in_tx(query_record)?
-            .iter()
-            .map(|&note| note.value())
-            .sum();
-        Ok(query_record.total_transparent_value_spent + sapling_spend_value + orchard_spend_value)
+            .map(|&coin| coin.value())
+            .sum::<u64>();
+        let sapling_spend_value = sapling_spends.iter().map(|&note| note.value()).sum::<u64>();
+        let orchard_spend_value = orchard_spends.iter().map(|&note| note.value()).sum::<u64>();
+
+        Ok(transparent_spend_value + sapling_spend_value + orchard_spend_value)
     }
-    // The value that's output, but *NOT* to an explicit receiver (unless this is running on the winning validator!)
-    // is the fee.
-    fn total_value_output_to_explicit_receivers(&self, query_record: &TransactionRecord) -> u64 {
-        let transparent_output_value: u64 = query_record
-            .transparent_outputs()
-            .iter()
-            .map(|note| note.value())
-            .sum();
-        let sapling_output_value: u64 = query_record
-            .sapling_notes()
-            .iter()
-            .map(|note| note.value())
-            .sum();
-        let orchard_output_value: u64 = query_record
-            .orchard_notes()
-            .iter()
-            .map(|note| note.value())
-            .sum();
-        transparent_output_value
-            + sapling_output_value
-            + orchard_output_value
-            + query_record.value_outgoing()
+
+    fn get_all_transparent_outputs(&self) -> Vec<&TransparentOutput> {
+        self.values()
+            .flat_map(|record| record.transparent_outputs())
+            .collect()
+    }
+    /// Because this method needs access to all outputs to query their
+    /// "spent" txid it is a method of the TransactionRecordsById
+    /// It's theoretically possible to create a 0-input transaction, but I
+    /// don't know if it's allowed in protocol.  For the moment I conservatively
+    /// assume that a 0-input transaction is unexpected behavior.
+    /// A transaction created by another capability, using only shielded inputs,
+    /// will also be ZeroInputTransaction.
+    fn get_transparent_coins_spent_in_tx(
+        &self,
+        query_record: &TransactionRecord,
+    ) -> Vec<&TransparentOutput> {
+        self.get_all_transparent_outputs()
+            .into_iter()
+            .filter(|o| {
+                (*o.spending_tx_status()).map_or(false, |(txid, _)| txid == query_record.txid)
+            })
+            .collect()
     }
     /// Calculate the fee for a transaction in the wallet
     ///
@@ -333,18 +429,7 @@ impl TransactionRecordsById {
         query_record: &TransactionRecord,
     ) -> Result<u64, FeeError> {
         let input_value = self.total_value_input_to_transaction(query_record)?;
-
-        if input_value == 0 {
-            if query_record.value_outgoing() == 0 {
-                return Err(FeeError::ReceivedTransaction);
-            } else {
-                return Err(FeeError::OutgoingWithoutSpends(
-                    query_record.outgoing_tx_data.to_vec(),
-                ));
-            }
-        }
-
-        let explicit_output_value = self.total_value_output_to_explicit_receivers(query_record);
+        let explicit_output_value = query_record.total_value_output_to_explicit_receivers();
 
         if input_value >= explicit_output_value {
             Ok(input_value - explicit_output_value)
@@ -359,7 +444,7 @@ impl TransactionRecordsById {
     /// Invalidates all those transactions which were broadcast but never 'confirmed' accepted by a miner.
     pub(crate) fn clear_expired_mempool(&mut self, latest_height: u64) {
         let cutoff = BlockHeight::from_u32(
-            (latest_height.saturating_sub(zingoconfig::MAX_REORG as u64)) as u32,
+            (latest_height.saturating_sub(crate::config::MAX_REORG as u64)) as u32,
         );
 
         let txids_to_remove = self
@@ -376,7 +461,65 @@ impl TransactionRecordsById {
 
         self.invalidate_transactions(txids_to_remove);
     }
+
+    /// Note this method is INCORRECT in the case of a 0-value, 0-fee transaction from the
+    /// Creating Capability.  Such a transaction would violate ZIP317, but could exist in
+    /// the Zcash protocol
+    ///  TODO:   Test and handle 0-value, 0-fee transaction
+    pub(crate) fn transaction_kind(
+        &self,
+        query_record: &TransactionRecord,
+        chain: &ChainType,
+    ) -> TransactionKind {
+        let zfz_address = match chain {
+            ChainType::Mainnet => ZENNIES_FOR_ZINGO_DONATION_ADDRESS,
+            ChainType::Testnet => ZENNIES_FOR_ZINGO_TESTNET_ADDRESS,
+            ChainType::Regtest(_) => ZENNIES_FOR_ZINGO_REGTEST_ADDRESS,
+        };
+
+        let transparent_spends = self.get_transparent_coins_spent_in_tx(query_record);
+        let sapling_spends = self
+            .get_sapling_notes_spent_in_tx(query_record, false)
+            .expect("cannot fail. fail_on_miss is set false");
+        let orchard_spends = self
+            .get_orchard_notes_spent_in_tx(query_record, false)
+            .expect("cannot fail. fail_on_miss is set false");
+
+        if transparent_spends.is_empty()
+            && sapling_spends.is_empty()
+            && orchard_spends.is_empty()
+            && query_record.outgoing_tx_data.is_empty()
+        {
+            // no spends and no outgoing tx data
+            TransactionKind::Received
+        } else if !transparent_spends.is_empty()
+            && sapling_spends.is_empty()
+            && orchard_spends.is_empty()
+            && query_record.outgoing_tx_data.is_empty()
+            && (!query_record.orchard_notes().is_empty() | !query_record.sapling_notes().is_empty())
+        {
+            // only transparent spends, no outgoing tx data and notes received
+            // TODO: this could be improved by checking outputs recipient addr against the wallet addrs
+            TransactionKind::Sent(SendType::Shield)
+        } else if query_record.outgoing_tx_data.is_empty()
+            || (query_record.outgoing_tx_data.len() == 1
+                && query_record.outgoing_tx_data.iter().any(|otd| {
+                    otd.recipient_address == *zfz_address
+                        || otd.recipient_ua == Some(zfz_address.to_string())
+                }))
+        {
+            // not Received, this capability created this transaction
+            // not Shield, notes were spent
+            // no outgoing tx data, with the exception of ONLY a Zennies For Zingo! donation
+            TransactionKind::Sent(SendType::SendToSelf)
+        } else {
+            TransactionKind::Sent(SendType::Send)
+        }
+    }
+
     /// TODO: Add Doc Comment Here!
+    #[allow(deprecated)]
+    #[deprecated(note = "uses unstable deprecated functions")]
     pub fn total_funds_spent_in(&self, txid: &TxId) -> u64 {
         self.get(txid)
             .map(TransactionRecord::total_value_spent)
@@ -387,6 +530,8 @@ impl TransactionRecordsById {
     //
     // TODO: When we start working on multi-sig, this could cause issues about hiding sends-to-self
     /// TODO: Add Doc Comment Here!
+    #[allow(deprecated)]
+    #[deprecated(note = "uses unstable deprecated functions")]
     pub fn check_notes_mark_change(&mut self, txid: &TxId) {
         //TODO: Incorrect with a 0-value fee somehow
         if self.total_funds_spent_in(txid) > 0 {
@@ -411,36 +556,55 @@ impl TransactionRecordsById {
             }
         });
     }
-    pub(crate) fn create_modify_get_transaction_metadata(
+    pub(crate) fn create_modify_get_transaction_record(
         &mut self,
         txid: &TxId,
-        status: zingo_status::confirmation_status::ConfirmationStatus,
-        datetime: u64,
+        status: ConfirmationStatus,
+        datetime: Option<u32>,
     ) -> &'_ mut TransactionRecord {
-        self.entry(*txid)
-            // if we already have the transaction metadata, it may be newly confirmed. update confirmation_status
-            .and_modify(|transaction_metadata| {
-                transaction_metadata.status = status;
-                transaction_metadata.datetime = datetime;
-            })
-            // if this transaction is new to our data, insert it
-            .or_insert_with(|| TransactionRecord::new(status, datetime, txid))
+        // check if there is already a confirmed transaction with the same txid
+        let existing_tx_confirmed = if let Some(existing_tx) = self.get(txid) {
+            existing_tx.status.is_confirmed()
+        } else {
+            false
+        };
+
+        // if datetime is None, take the datetime value from existing transaction in the wallet
+        let datetime = datetime.unwrap_or_else(|| {
+            self.get(txid).expect(
+            "datetime should only be None when re-scanning a tx that already exists in the wallet",
+                )
+                .datetime as u32
+        });
+
+        // prevent confirmed transaction from being overwritten by pending transaction
+        if existing_tx_confirmed && !status.is_confirmed() {
+            self.get_mut(txid)
+                .expect("previous check proves this tx exists")
+        } else {
+            self.entry(*txid)
+                // if we already have the transaction metadata, it may be newly confirmed. update confirmation_status
+                .and_modify(|transaction_metadata| {
+                    transaction_metadata.status = status;
+                    transaction_metadata.datetime = datetime as u64;
+                })
+                // if this transaction is new to our data, insert it
+                .or_insert_with(|| TransactionRecord::new(status, datetime as u64, txid))
+        }
     }
 
     /// TODO: Add Doc Comment Here!
     pub fn add_taddr_spent(
         &mut self,
         txid: TxId,
-        status: zingo_status::confirmation_status::ConfirmationStatus,
-        timestamp: u64,
+        status: ConfirmationStatus,
+        timestamp: Option<u32>,
         total_transparent_value_spent: u64,
     ) {
         let transaction_metadata =
-            self.create_modify_get_transaction_metadata(&txid, status, timestamp);
+            self.create_modify_get_transaction_record(&txid, status, timestamp);
 
         transaction_metadata.total_transparent_value_spent = total_transparent_value_spent;
-
-        self.check_notes_mark_change(&txid);
     }
 
     /// TODO: Add Doc Comment Here!
@@ -449,7 +613,7 @@ impl TransactionRecordsById {
         spent_txid: TxId,
         output_num: u32,
         source_txid: TxId,
-        spending_tx_status: zingo_status::confirmation_status::ConfirmationStatus,
+        spending_tx_status: ConfirmationStatus,
     ) -> u64 {
         // Find the UTXO
         let value = if let Some(utxo_transacion_metadata) = self.get_mut(&spent_txid) {
@@ -458,15 +622,8 @@ impl TransactionRecordsById {
                 .iter_mut()
                 .find(|u| u.txid == spent_txid && u.output_index == output_num as u64)
             {
-                if spending_tx_status.is_confirmed() {
-                    // Mark this utxo as spent
-                    *spent_utxo.spent_mut() =
-                        Some((source_txid, spending_tx_status.get_height().into()));
-                    spent_utxo.pending_spent = None;
-                } else {
-                    spent_utxo.pending_spent =
-                        Some((source_txid, u32::from(spending_tx_status.get_height())));
-                }
+                // Mark this utxo as spent
+                *spent_utxo.spending_tx_status_mut() = Some((source_txid, spending_tx_status));
 
                 spent_utxo.value
             } else {
@@ -488,14 +645,14 @@ impl TransactionRecordsById {
         &mut self,
         txid: TxId,
         taddr: String,
-        status: zingo_status::confirmation_status::ConfirmationStatus,
-        timestamp: u64,
+        status: ConfirmationStatus,
+        timestamp: Option<u32>,
         vout: &zcash_primitives::transaction::components::TxOut,
         output_num: u32,
     ) {
         // Read or create the current TxId
         let transaction_metadata =
-            self.create_modify_get_transaction_metadata(&txid, status, timestamp);
+            self.create_modify_get_transaction_record(&txid, status, timestamp);
 
         // Add this UTXO if it doesn't already exist
         if transaction_metadata
@@ -513,60 +670,17 @@ impl TransactionRecordsById {
                     vout.script_pubkey.0.clone(),
                     u64::from(vout.value),
                     None,
-                    None,
                 ),
             );
         }
     }
-    /// witness tree requirement:
-    ///
-    pub(crate) fn add_pending_note<D>(
-        &mut self,
-        txid: TxId,
-        height: BlockHeight,
-        timestamp: u64,
-        note: D::Note,
-        to: D::Recipient,
-        output_index: usize,
-    ) where
-        D: DomainWalletExt,
-        D::Note: PartialEq + Clone,
-        D::Recipient: Recipient,
-    {
-        let status = zingo_status::confirmation_status::ConfirmationStatus::Pending(height);
-        let transaction_record =
-            self.create_modify_get_transaction_metadata(&txid, status, timestamp);
 
-        match D::WalletNote::transaction_record_to_outputs_vec(transaction_record)
-            .iter_mut()
-            .find(|n| n.note() == &note)
-        {
-            None => {
-                let nd = D::WalletNote::from_parts(
-                    to.diversifier(),
-                    note,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    // if this is change, we'll mark it later in check_notes_mark_change
-                    false,
-                    false,
-                    Some(output_index as u32),
-                );
-
-                D::WalletNote::transaction_metadata_notes_mut(transaction_record).push(nd);
-            }
-            Some(_) => {}
-        }
-    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_new_note<D: DomainWalletExt>(
         &mut self,
         txid: TxId,
-        status: zingo_status::confirmation_status::ConfirmationStatus,
-        timestamp: u64,
+        status: ConfirmationStatus,
+        timestamp: Option<u32>,
         note: <D::WalletNote as crate::wallet::notes::ShieldedNoteInterface>::Note,
         to: D::Recipient,
         have_spending_key: bool,
@@ -575,19 +689,15 @@ impl TransactionRecordsById {
         >,
         output_index: u32,
         position: incrementalmerkletree::Position,
-    ) where
-        D::Note: PartialEq + Clone,
-        D::Recipient: Recipient,
-    {
+    ) {
         let transaction_metadata =
-            self.create_modify_get_transaction_metadata(&txid, status, timestamp);
+            self.create_modify_get_transaction_record(&txid, status, timestamp);
 
         let nd = D::WalletNote::from_parts(
             D::Recipient::diversifier(&to),
             note.clone(),
             Some(position),
             nullifier,
-            None,
             None,
             None,
             // if this is change, we'll mark it later in check_notes_mark_change
@@ -653,24 +763,42 @@ impl TransactionRecordsById {
     }
 
     /// get a list of spendable NoteIds with associated note values
+    #[allow(clippy::type_complexity)]
     pub(crate) fn get_spendable_note_ids_and_values(
         &self,
         sources: &[zcash_client_backend::ShieldedProtocol],
         anchor_height: zcash_primitives::consensus::BlockHeight,
         exclude: &[NoteId],
-    ) -> Vec<(NoteId, u64)> {
-        self.values()
+    ) -> Result<Vec<(NoteId, u64)>, Vec<(TxId, BlockHeight)>> {
+        let mut missing_output_index = vec![];
+        let ok = self
+            .values()
             .flat_map(|transaction_record| {
                 if transaction_record
                     .status
                     .is_confirmed_before_or_at(&anchor_height)
                 {
-                    transaction_record.get_spendable_note_ids_and_values(sources, exclude)
+                    if let Ok(notes_from_tx) =
+                        transaction_record.get_spendable_note_ids_and_values(sources, exclude)
+                    {
+                        notes_from_tx
+                    } else {
+                        missing_output_index.push((
+                            transaction_record.txid,
+                            transaction_record.status.get_height(),
+                        ));
+                        vec![]
+                    }
                 } else {
                     vec![]
                 }
             })
-            .collect()
+            .collect();
+        if missing_output_index.is_empty() {
+            Ok(ok)
+        } else {
+            Err(missing_output_index)
+        }
     }
 }
 
@@ -683,6 +811,7 @@ impl Default for TransactionRecordsById {
 
 #[cfg(test)]
 mod tests {
+
     use crate::{
         mocks::{
             nullifier::{OrchardNullifierBuilder, SaplingNullifierBuilder},
@@ -692,11 +821,9 @@ mod tests {
         wallet::{
             data::mocks::OutgoingTxDataBuilder,
             notes::{
-                orchard::mocks::OrchardNoteBuilder,
-                query::{OutputPoolQuery, OutputQuery, OutputSpendStatusQuery},
-                sapling::mocks::SaplingNoteBuilder,
-                transparent::mocks::TransparentOutputBuilder,
-                OutputInterface, SaplingNote,
+                orchard::mocks::OrchardNoteBuilder, query::OutputSpendStatusQuery,
+                sapling::mocks::SaplingNoteBuilder, transparent::mocks::TransparentOutputBuilder,
+                Output, OutputInterface,
             },
             transaction_record::mocks::{nine_note_transaction_record, TransactionRecordBuilder},
         },
@@ -707,7 +834,7 @@ mod tests {
     use sapling_crypto::note_encryption::SaplingDomain;
     use zcash_client_backend::{wallet::ReceivedNote, ShieldedProtocol};
     use zcash_primitives::{consensus::BlockHeight, transaction::TxId};
-    use zingo_status::confirmation_status::ConfirmationStatus::Confirmed;
+    use zingo_status::confirmation_status::ConfirmationStatus::{self, Confirmed};
 
     #[test]
     fn invalidate_all_transactions_after_or_at_height() {
@@ -718,27 +845,24 @@ mod tests {
             .build();
         let spending_txid = transaction_record_later.txid;
 
+        let spend_in_known_tx = Some((spending_txid, Confirmed(15.into())));
+
         let transaction_record_early = TransactionRecordBuilder::default()
             .randomize_txid()
             .status(Confirmed(5.into()))
             .transparent_outputs(
                 TransparentOutputBuilder::default()
-                    .spent(Some((spending_txid, 15)))
+                    .spending_tx_status(spend_in_known_tx)
                     .clone(),
             )
             .sapling_notes(
                 SaplingNoteBuilder::default()
-                    .spent(Some((spending_txid, 15)))
+                    .spending_tx_status(spend_in_known_tx)
                     .clone(),
             )
             .orchard_notes(
                 OrchardNoteBuilder::default()
-                    .spent(Some((spending_txid, 15)))
-                    .clone(),
-            )
-            .sapling_notes(
-                SaplingNoteBuilder::default()
-                    .spent(Some((random_txid(), 15)))
+                    .spending_tx_status(spend_in_known_tx)
                     .clone(),
             )
             .orchard_notes(OrchardNoteBuilder::default())
@@ -762,28 +886,27 @@ mod tests {
             .unwrap();
 
         let query_for_spentish_notes = OutputSpendStatusQuery::spentish();
-        let spentish_notes_in_tx_cvnwis = transaction_record_cvnwis.query_for_ids(OutputQuery {
-            spend_status: query_for_spentish_notes,
-            pools: OutputPoolQuery::any(),
-        });
-        assert_eq!(spentish_notes_in_tx_cvnwis.len(), 1);
-        // ^ so there is one spent note still in this transaction
-        assert_ne!(
-            SaplingNote::transaction_record_to_outputs_vec_query(
-                transaction_record_cvnwis,
-                query_for_spentish_notes
-            )
-            .first()
-            .unwrap()
-            .spent(),
-            &Some((spending_txid, 15u32))
+        let spentish_sapling_notes_in_tx_cvnwis = Output::get_all_outputs_with_status(
+            transaction_record_cvnwis,
+            query_for_spentish_notes,
         );
-        // ^ but it was not spent in the deleted txid
+        assert_eq!(spentish_sapling_notes_in_tx_cvnwis.len(), 0);
+    }
+
+    // TODO: move this into an associated fn of TransparentOutputBuilder
+    fn spent_transparent_output_builder(
+        amount: u64,
+        sent: (TxId, ConfirmationStatus),
+    ) -> TransparentOutputBuilder {
+        TransparentOutputBuilder::default()
+            .value(amount)
+            .spending_tx_status(Some(sent))
+            .to_owned()
     }
 
     fn spent_sapling_note_builder(
         amount: u64,
-        sent: (TxId, u32),
+        sent: (TxId, ConfirmationStatus),
         sapling_nullifier: &sapling_crypto::Nullifier,
     ) -> SaplingNoteBuilder {
         SaplingNoteBuilder::default()
@@ -792,13 +915,13 @@ mod tests {
                     .value(sapling_crypto::value::NoteValue::from_raw(amount))
                     .to_owned(),
             )
-            .spent(Some(sent))
+            .spending_tx_status(Some(sent))
             .nullifier(Some(*sapling_nullifier))
             .to_owned()
     }
     fn spent_orchard_note_builder(
         amount: u64,
-        sent: (TxId, u32),
+        sent: (TxId, ConfirmationStatus),
         orchard_nullifier: &orchard::note::Nullifier,
     ) -> OrchardNoteBuilder {
         OrchardNoteBuilder::default()
@@ -807,7 +930,7 @@ mod tests {
                     .value(orchard::value::NoteValue::from_raw(amount))
                     .to_owned(),
             )
-            .spent(Some(sent))
+            .spending_tx_status(Some(sent))
             .nullifier(Some(*orchard_nullifier))
             .to_owned()
     }
@@ -822,11 +945,10 @@ mod tests {
             .spent_sapling_nullifiers(sapling_nullifier_builder.assign_unique_nullifier().clone())
             .spent_orchard_nullifiers(orchard_nullifier_builder.assign_unique_nullifier().clone())
             .spent_orchard_nullifiers(orchard_nullifier_builder.assign_unique_nullifier().clone())
-            .transparent_outputs(TransparentOutputBuilder::default())
-            .sapling_notes(SaplingNoteBuilder::default())
-            .orchard_notes(OrchardNoteBuilder::default())
-            .total_transparent_value_spent(30_000)
-            .outgoing_tx_data(OutgoingTxDataBuilder::default())
+            .transparent_outputs(TransparentOutputBuilder::default()) // value 100_000
+            .sapling_notes(SaplingNoteBuilder::default()) // value 200_000
+            .orchard_notes(OrchardNoteBuilder::default()) // value 800_000
+            .outgoing_tx_data(OutgoingTxDataBuilder::default()) // value 50_000
             .build();
         let sent_txid = sent_transaction_record.txid;
         let first_sapling_nullifier = sent_transaction_record.spent_sapling_nullifiers[0];
@@ -834,33 +956,34 @@ mod tests {
         let first_orchard_nullifier = sent_transaction_record.spent_orchard_nullifiers[0];
         let second_orchard_nullifier = sent_transaction_record.spent_orchard_nullifiers[1];
         // t-note + s-note + o-note + outgoing_tx_data
-        let expected_output_value: u64 = 100_000 + 200_000 + 800_000 + 50_000;
+        let expected_output_value: u64 = 100_000 + 200_000 + 800_000 + 50_000; // 1_150_000
 
+        let spent_in_sent_txid = (sent_txid, Confirmed(15.into()));
         let first_received_transaction_record = TransactionRecordBuilder::default()
             .randomize_txid()
             .status(Confirmed(5.into()))
             .sapling_notes(spent_sapling_note_builder(
                 175_000,
-                (sent_txid, 15),
+                spent_in_sent_txid,
                 &first_sapling_nullifier,
             ))
             .sapling_notes(spent_sapling_note_builder(
                 325_000,
-                (sent_txid, 15),
+                spent_in_sent_txid,
                 &second_sapling_nullifier,
             ))
             .orchard_notes(spent_orchard_note_builder(
                 500_000,
-                (sent_txid, 15),
+                spent_in_sent_txid,
                 &first_orchard_nullifier,
             ))
-            .transparent_outputs(TransparentOutputBuilder::default())
+            .transparent_outputs(spent_transparent_output_builder(30_000, spent_in_sent_txid)) // 100_000
             .sapling_notes(
                 SaplingNoteBuilder::default()
-                    .spent(Some((random_txid(), 12)))
+                    .spending_tx_status(Some((random_txid(), Confirmed(12.into()))))
                     .to_owned(),
             )
-            .orchard_notes(OrchardNoteBuilder::default())
+            .orchard_notes(OrchardNoteBuilder::default()) // 800_000
             .set_output_indexes()
             .build();
         let second_received_transaction_record = TransactionRecordBuilder::default()
@@ -868,14 +991,14 @@ mod tests {
             .status(Confirmed(7.into()))
             .orchard_notes(spent_orchard_note_builder(
                 200_000,
-                (sent_txid, 15),
+                spent_in_sent_txid,
                 &second_orchard_nullifier,
             ))
             .transparent_outputs(TransparentOutputBuilder::default())
             .sapling_notes(SaplingNoteBuilder::default().clone())
             .orchard_notes(
                 OrchardNoteBuilder::default()
-                    .spent(Some((random_txid(), 13)))
+                    .spending_tx_status(Some((random_txid(), Confirmed(13.into()))))
                     .to_owned(),
             )
             .set_output_indexes()
@@ -909,7 +1032,9 @@ mod tests {
                     transparent::mocks::TransparentOutputBuilder,
                 },
                 transaction_record::mocks::TransactionRecordBuilder,
-                transaction_records_by_id::TransactionRecordsById,
+                transaction_records_by_id::{
+                    tests::spent_transparent_output_builder, TransactionRecordsById,
+                },
             },
         };
 
@@ -946,7 +1071,7 @@ mod tests {
                                 .value(sapling_crypto::value::NoteValue::from_raw(175_000))
                                 .to_owned(),
                         )
-                        .spent(Some((sent_txid, 15)))
+                        .spending_tx_status(Some((sent_txid, Confirmed(15.into()))))
                         .nullifier(Some(sapling_nullifier))
                         .to_owned(),
                 )
@@ -1008,12 +1133,19 @@ mod tests {
                         )
                         .to_owned(),
                 )
-                .total_transparent_value_spent(20_000)
                 .build();
             let sent_txid = transaction_record.txid;
+            let spent_in_sent_txid = (sent_txid, Confirmed(15.into()));
+            let transparent_funding_tx = TransactionRecordBuilder::default()
+                .randomize_txid()
+                .status(Confirmed(7.into()))
+                .transparent_outputs(spent_transparent_output_builder(20_000, spent_in_sent_txid))
+                .set_output_indexes()
+                .build();
 
             let mut transaction_records_by_id = TransactionRecordsById::default();
             transaction_records_by_id.insert_transaction_record(transaction_record);
+            transaction_records_by_id.insert_transaction_record(transparent_funding_tx);
 
             let fee = transaction_records_by_id
                 .calculate_transaction_fee(transaction_records_by_id.get(&sent_txid).unwrap());

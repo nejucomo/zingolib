@@ -1,6 +1,8 @@
 //! Provides unifying interfaces for transaction management across Sapling and Orchard
+use crate::wallet::notes::interface::OutputConstructor;
 use std::io::{self, Read, Write};
 
+use crate::config::ChainType;
 use crate::data::witness_trees::WitnessTrees;
 use crate::wallet::notes::OutputInterface;
 use crate::wallet::notes::ShieldedNoteInterface;
@@ -11,7 +13,7 @@ use crate::wallet::{
     },
     keys::unified::WalletCapability,
     notes::{OrchardNote, SaplingNote},
-    tx_map_and_maybe_trees::TxMapAndMaybeTrees,
+    tx_map::TxMap,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use incrementalmerkletree::{witness::IncrementalWitness, Hashable, Level, Position};
@@ -49,7 +51,9 @@ use zcash_primitives::{
         Transaction, TxId,
     },
 };
-use zingoconfig::ChainType;
+use zingo_status::confirmation_status::ConfirmationStatus;
+
+use super::keys::unified::UnifiedKeyStore;
 
 /// This provides a uniform `.to_bytes` to types that might require it in a generic context.
 pub trait ToBytes<const N: usize> {
@@ -102,14 +106,15 @@ impl<const N: usize> ToBytes<N> for [u8; N] {
 /// Exposes the out_ciphertext, domain, and value_commitment in addition to the
 /// required methods of ShieldedOutput
 pub trait ShieldedOutputExt<D: Domain>: ShieldedOutput<D, ENC_CIPHERTEXT_SIZE> {
-    /// TODO: Add Doc Comment Here!
+    /// Sapling and Orchard currently, more protocols may be supported in the future
     fn domain(&self, height: BlockHeight, parameters: ChainType) -> D;
 
     /// A decryption key for `enc_ciphertext`.  `out_ciphertext` is _itself_  decryptable
     /// with the `OutgoingCipherKey` "`ock`".
     fn out_ciphertext(&self) -> [u8; 80];
 
-    /// TODO: Add Doc Comment Here!
+    /// This data is stored in an ordered structure, across which a commitment merkle tree
+    /// is built.
     fn value_commitment(&self) -> D::ValueCommitment;
 }
 
@@ -287,11 +292,7 @@ fn slice_to_array<const N: usize>(slice: &[u8]) -> &[u8; N] {
 }
 
 /// TODO: Add Doc Comment Here!
-pub trait CompactOutput<D: DomainWalletExt>: Sized + Clone
-where
-    D::Recipient: Recipient,
-    <D as Domain>::Note: PartialEq + Clone,
-{
+pub trait CompactOutput<D: DomainWalletExt>: Sized + Clone {
     /// TODO: Add Doc Comment Here!
     type CompactAction: ShieldedOutput<D, COMPACT_NOTE_SIZE>;
 
@@ -359,11 +360,7 @@ impl CompactOutput<OrchardDomain> for CompactOrchardAction {
 /// domain. In the Orchard Domain bundles comprise Actions each of which contains
 /// both a Spend and an Output (though either or both may be dummies). Sapling transmissions,
 /// as implemented, contain a 1:1 ratio of Spends and Outputs.
-pub trait Bundle<D: DomainWalletExt>
-where
-    D::Recipient: Recipient,
-    D::Note: PartialEq + Clone,
-{
+pub trait Bundle<D: DomainWalletExt> {
     /// An expenditure of an output, such that its value is distributed among *this* transaction's outputs.
     type Spend: Spend;
     /// A value store that is completely emptied by transfer of its contents to another output.
@@ -454,11 +451,15 @@ type MemoryStoreShardTree<T> =
     ShardTree<MemoryShardStore<T, BlockHeight>, COMMITMENT_TREE_LEVELS, MAX_SHARD_LEVEL>;
 
 /// TODO: Add Doc Comment Here!
-pub trait DomainWalletExt: Domain + BatchDomain
-where
-    Self: Sized,
-    Self::Note: PartialEq + Clone,
-    Self::Recipient: Recipient,
+pub trait DomainWalletExt:
+    Domain<
+        Note: PartialEq + Clone,
+        Recipient: Recipient,
+        ExtractedCommitmentBytes: Into<[u8; 32]>,
+        Memo: ToBytes<512>,
+        IncomingViewingKey: Clone,
+    > + BatchDomain
+    + Sized
 {
     /// TODO: Add Doc Comment Here!
     const NU: NetworkUpgrade;
@@ -471,11 +472,11 @@ where
     type Fvk: Clone
         + Send
         + Diversifiable<Note = Self::WalletNote, Address = Self::Recipient>
-        + for<'a> TryFrom<&'a WalletCapability>
+        + for<'a> TryFrom<&'a UnifiedKeyStore>
         + super::keys::unified::Fvk<Self>;
 
     /// TODO: Add Doc Comment Here!
-    type SpendingKey: for<'a> TryFrom<&'a WalletCapability> + Clone;
+    type SpendingKey: for<'a> TryFrom<&'a UnifiedKeyStore> + Clone;
     /// TODO: Add Doc Comment Here!
     type CompactOutput: CompactOutput<Self>;
     /// TODO: Add Doc Comment Here!
@@ -491,7 +492,7 @@ where
 
     /// TODO: Add Doc Comment Here!
     fn sum_pool_change(transaction_md: &TransactionRecord) -> u64 {
-        Self::WalletNote::transaction_record_to_outputs_vec(transaction_md)
+        Self::WalletNote::get_record_outputs(transaction_md)
             .iter()
             .filter(|nd| nd.is_change())
             .map(|nd| nd.value())
@@ -500,7 +501,7 @@ where
 
     /// TODO: Add Doc Comment Here!
     fn transaction_metadata_set_to_shardtree(
-        txmds: &TxMapAndMaybeTrees,
+        txmds: &TxMap,
     ) -> Option<&MemoryStoreShardTree<<Self::WalletNote as ShieldedNoteInterface>::Node>> {
         txmds
             .witness_trees()
@@ -509,7 +510,7 @@ where
 
     /// TODO: Add Doc Comment Here!
     fn transaction_metadata_set_to_shardtree_mut(
-        txmds: &mut TxMapAndMaybeTrees,
+        txmds: &mut TxMap,
     ) -> Option<&mut MemoryStoreShardTree<<Self::WalletNote as ShieldedNoteInterface>::Node>> {
         txmds
             .witness_trees_mut()
@@ -536,6 +537,10 @@ where
     /// TODO: Add Doc Comment Here!
     fn get_tree(tree_state: &TreeState) -> &String;
 
+    /// Counts the number of outputs in earlier pools, to allow for
+    // the output index to be a single source for output order
+    fn output_index_offset(transaction: &Transaction) -> u64;
+
     /// TODO: Add Doc Comment Here!
     fn ua_from_contained_receiver<'a>(
         unified_spend_auth: &'a WalletCapability,
@@ -543,10 +548,7 @@ where
     ) -> Option<&'a UnifiedAddress>;
 
     /// TODO: Add Doc Comment Here!
-    fn wc_to_fvk(wc: &WalletCapability) -> Result<Self::Fvk, String>;
-
-    /// TODO: Add Doc Comment Here!
-    fn wc_to_sk(wc: &WalletCapability) -> Result<Self::SpendingKey, String>;
+    fn unified_key_store_to_fvk(unified_key_store: &UnifiedKeyStore) -> Result<Self::Fvk, String>;
 }
 
 impl DomainWalletExt for SaplingDomain {
@@ -598,6 +600,13 @@ impl DomainWalletExt for SaplingDomain {
         &tree_state.sapling_tree
     }
 
+    fn output_index_offset(transaction: &Transaction) -> u64 {
+        transaction
+            .transparent_bundle()
+            .map(|tbundle| tbundle.vout.len() as u64)
+            .unwrap_or(0)
+    }
+
     fn ua_from_contained_receiver<'a>(
         unified_spend_auth: &'a WalletCapability,
         receiver: &Self::Recipient,
@@ -608,12 +617,8 @@ impl DomainWalletExt for SaplingDomain {
             .find(|ua| ua.sapling() == Some(receiver))
     }
 
-    fn wc_to_fvk(wc: &WalletCapability) -> Result<Self::Fvk, String> {
-        Self::Fvk::try_from(wc)
-    }
-
-    fn wc_to_sk(wc: &WalletCapability) -> Result<Self::SpendingKey, String> {
-        Self::SpendingKey::try_from(wc)
+    fn unified_key_store_to_fvk(unified_key_store: &UnifiedKeyStore) -> Result<Self::Fvk, String> {
+        Self::Fvk::try_from(unified_key_store).map_err(|e| e.to_string())
     }
 }
 
@@ -666,6 +671,14 @@ impl DomainWalletExt for OrchardDomain {
         &tree_state.orchard_tree
     }
 
+    fn output_index_offset(transaction: &Transaction) -> u64 {
+        SaplingDomain::output_index_offset(transaction)
+            + transaction
+                .sapling_bundle()
+                .map(|sbundle| sbundle.shielded_outputs().len() as u64)
+                .unwrap_or(0)
+    }
+
     fn ua_from_contained_receiver<'a>(
         unified_spend_capability: &'a WalletCapability,
         receiver: &Self::Recipient,
@@ -676,12 +689,8 @@ impl DomainWalletExt for OrchardDomain {
             .find(|unified_address| unified_address.orchard() == Some(receiver))
     }
 
-    fn wc_to_fvk(wc: &WalletCapability) -> Result<Self::Fvk, String> {
-        Self::Fvk::try_from(wc)
-    }
-
-    fn wc_to_sk(wc: &WalletCapability) -> Result<Self::SpendingKey, String> {
-        Self::SpendingKey::try_from(wc)
+    fn unified_key_store_to_fvk(unified_key_store: &UnifiedKeyStore) -> Result<Self::Fvk, String> {
+        Self::Fvk::try_from(unified_key_store).map_err(|e| e.to_string())
     }
 }
 
@@ -767,8 +776,7 @@ where
         note_and_metadata: &D::WalletNote,
         spend_key: Option<&D::SpendingKey>,
     ) -> bool {
-        note_and_metadata.spent().is_none()
-            && note_and_metadata.pending_spent().is_none()
+        note_and_metadata.spending_tx_status().is_none()
             && spend_key.is_some()
             && note_and_metadata.value() != 0
     }
@@ -892,15 +900,15 @@ impl SpendableNote<OrchardDomain> for SpendableOrchardNote {
 }
 
 /// TODO: Add Doc Comment Here!
-pub trait ReadableWriteable<Input>: Sized {
+pub trait ReadableWriteable<ReadInput = (), WriteInput = ()>: Sized {
     /// TODO: Add Doc Comment Here!
     const VERSION: u8;
 
     /// TODO: Add Doc Comment Here!
-    fn read<R: Read>(reader: R, input: Input) -> io::Result<Self>;
+    fn read<R: Read>(reader: R, input: ReadInput) -> io::Result<Self>;
 
     /// TODO: Add Doc Comment Here!
-    fn write<W: Write>(&self, writer: W) -> io::Result<()>;
+    fn write<W: Write>(&self, writer: W, input: WriteInput) -> io::Result<()>;
 
     /// TODO: Add Doc Comment Here!
     fn get_version<R: Read>(mut reader: R) -> io::Result<u8> {
@@ -919,10 +927,10 @@ pub trait ReadableWriteable<Input>: Sized {
     }
 }
 
-impl ReadableWriteable<()> for orchard::keys::SpendingKey {
+impl ReadableWriteable for orchard::keys::SpendingKey {
     const VERSION: u8 = 0; //Not applicable
 
-    fn read<R: Read>(mut reader: R, _: ()) -> io::Result<Self> {
+    fn read<R: Read>(mut reader: R, _input: ()) -> io::Result<Self> {
         let mut data = [0u8; 32];
         reader.read_exact(&mut data)?;
 
@@ -934,27 +942,27 @@ impl ReadableWriteable<()> for orchard::keys::SpendingKey {
         })
     }
 
-    fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, mut writer: W, _input: ()) -> io::Result<()> {
         writer.write_all(self.to_bytes())
     }
 }
 
-impl ReadableWriteable<()> for sapling_crypto::zip32::ExtendedSpendingKey {
+impl ReadableWriteable for sapling_crypto::zip32::ExtendedSpendingKey {
     const VERSION: u8 = 0; //Not applicable
 
-    fn read<R: Read>(reader: R, _: ()) -> io::Result<Self> {
+    fn read<R: Read>(reader: R, _input: ()) -> io::Result<Self> {
         Self::read(reader)
     }
 
-    fn write<W: Write>(&self, writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, writer: W, _input: ()) -> io::Result<()> {
         self.write(writer)
     }
 }
 
-impl ReadableWriteable<()> for sapling_crypto::zip32::DiversifiableFullViewingKey {
+impl ReadableWriteable for sapling_crypto::zip32::DiversifiableFullViewingKey {
     const VERSION: u8 = 0; //Not applicable
 
-    fn read<R: Read>(mut reader: R, _: ()) -> io::Result<Self> {
+    fn read<R: Read>(mut reader: R, _input: ()) -> io::Result<Self> {
         let mut fvk_bytes = [0u8; 128];
         reader.read_exact(&mut fvk_bytes)?;
         sapling_crypto::zip32::DiversifiableFullViewingKey::from_bytes(&fvk_bytes).ok_or(
@@ -965,19 +973,19 @@ impl ReadableWriteable<()> for sapling_crypto::zip32::DiversifiableFullViewingKe
         )
     }
 
-    fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, mut writer: W, _input: ()) -> io::Result<()> {
         writer.write_all(&self.to_bytes())
     }
 }
 
-impl ReadableWriteable<()> for orchard::keys::FullViewingKey {
+impl ReadableWriteable for orchard::keys::FullViewingKey {
     const VERSION: u8 = 0; //Not applicable
 
-    fn read<R: Read>(reader: R, _: ()) -> io::Result<Self> {
+    fn read<R: Read>(reader: R, _input: ()) -> io::Result<Self> {
         Self::read(reader)
     }
 
-    fn write<W: Write>(&self, writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, writer: W, _input: ()) -> io::Result<()> {
         self.write(writer)
     }
 }
@@ -994,17 +1002,19 @@ impl ReadableWriteable<(sapling_crypto::Diversifier, &WalletCapability)> for sap
         let rseed = super::data::read_sapling_rseed(&mut reader)?;
 
         Ok(
-            <SaplingDomain as DomainWalletExt>::wc_to_fvk(wallet_capability)
-                .expect("to get an fvk from a wc")
-                .fvk()
-                .vk
-                .to_payment_address(diversifier)
-                .unwrap()
-                .create_note(sapling_crypto::value::NoteValue::from_raw(value), rseed),
+            <SaplingDomain as DomainWalletExt>::unified_key_store_to_fvk(
+                wallet_capability.unified_key_store(),
+            )
+            .expect("to get an fvk from the unified key store")
+            .fvk()
+            .vk
+            .to_payment_address(diversifier)
+            .unwrap()
+            .create_note(sapling_crypto::value::NoteValue::from_raw(value), rseed),
         )
     }
 
-    fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, mut writer: W, _input: ()) -> io::Result<()> {
         writer.write_u8(Self::VERSION)?;
         writer.write_u64::<LittleEndian>(self.value().inner())?;
         super::data::write_sapling_rseed(&mut writer, self.rseed())?;
@@ -1037,8 +1047,10 @@ impl ReadableWriteable<(orchard::keys::Diversifier, &WalletCapability)> for orch
             "Nullifier not for note",
         ))?;
 
-        let fvk = <OrchardDomain as DomainWalletExt>::wc_to_fvk(wallet_capability)
-            .expect("to get an fvk from a wc");
+        let fvk = <OrchardDomain as DomainWalletExt>::unified_key_store_to_fvk(
+            wallet_capability.unified_key_store(),
+        )
+        .expect("to get an fvk from the unified key store");
         Option::from(orchard::note::Note::from_parts(
             fvk.address(diversifier, orchard::keys::Scope::External),
             orchard::value::NoteValue::from_raw(value),
@@ -1048,7 +1060,7 @@ impl ReadableWriteable<(orchard::keys::Diversifier, &WalletCapability)> for orch
         .ok_or(io::Error::new(io::ErrorKind::InvalidInput, "Invalid note"))
     }
 
-    fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, mut writer: W, _input: ()) -> io::Result<()> {
         writer.write_u8(Self::VERSION)?;
         writer.write_u64::<LittleEndian>(self.value().inner())?;
         writer.write_all(&self.rho().to_bytes())?;
@@ -1070,7 +1082,7 @@ impl<T>
 where
     T: ShieldedNoteInterface,
 {
-    const VERSION: u8 = 4;
+    const VERSION: u8 = 5;
 
     fn read<R: Read>(
         mut reader: R,
@@ -1087,52 +1099,69 @@ where
         let external_version = Self::get_version(&mut reader)?;
 
         if external_version < 2 {
-            let mut x = <T as ShieldedNoteInterface>::get_deprecated_serialized_view_key_buffer();
-            reader.read_exact(&mut x).expect("To not used this data.");
+            let mut discarded_bytes =
+                <T as ShieldedNoteInterface>::get_deprecated_serialized_view_key_buffer();
+            reader
+                .read_exact(&mut discarded_bytes)
+                .expect("To not used this data.");
         }
 
         let mut diversifier_bytes = [0u8; 11];
         reader.read_exact(&mut diversifier_bytes)?;
         let diversifier = T::Diversifier::from_bytes(diversifier_bytes);
 
-        let note =
-            <T::Note as ReadableWriteable<_>>::read(&mut reader, (diversifier, wallet_capability))?;
+        let note = <T::Note as ReadableWriteable<_, _>>::read(
+            &mut reader,
+            (diversifier, wallet_capability),
+        )?;
 
-        let witnessed_position = if external_version >= 4 {
-            Position::from(reader.read_u64::<LittleEndian>()?)
-        } else {
-            let witnesses_vec = Vector::read(&mut reader, |r| read_incremental_witness(r))?;
+        let witnessed_position = match external_version {
+            5.. => Optional::read(&mut reader, <R>::read_u64::<LittleEndian>)?.map(Position::from),
+            4 => Some(Position::from(reader.read_u64::<LittleEndian>()?)),
+            ..4 => {
+                let witnesses_vec = Vector::read(&mut reader, |r| read_incremental_witness(r))?;
 
-            let top_height = reader.read_u64::<LittleEndian>()?;
-            let witnesses = WitnessCache::<T::Node>::new(witnesses_vec, top_height);
+                let top_height = reader.read_u64::<LittleEndian>()?;
+                let witnesses = WitnessCache::<T::Node>::new(witnesses_vec, top_height);
 
-            let pos = witnesses
-                .last()
-                .map(|w| w.witnessed_position())
-                .unwrap_or_else(|| Position::from(0));
-            for (i, witness) in witnesses.witnesses.into_iter().rev().enumerate().rev() {
-                let height = BlockHeight::from(top_height as u32 - i as u32);
-                if let Some(&mut ref mut wits) = inc_wit_vec {
-                    wits.push((witness, height));
+                let pos = witnesses.last().map(|w| w.witnessed_position());
+                for (i, witness) in witnesses.witnesses.into_iter().rev().enumerate().rev() {
+                    let height = BlockHeight::from(top_height as u32 - i as u32);
+                    if let Some(&mut ref mut wits) = inc_wit_vec {
+                        wits.push((witness, height));
+                    }
                 }
+                pos
             }
-            pos
         };
 
-        let mut nullifier = [0u8; 32];
-        reader.read_exact(&mut nullifier)?;
-        let nullifier = T::Nullifier::from_bytes(nullifier);
+        let read_nullifier = |r: &mut R| {
+            let mut nullifier = [0u8; 32];
+            r.read_exact(&mut nullifier)?;
+            Ok(T::Nullifier::from_bytes(nullifier))
+        };
 
-        // Note that this is only the spent field, we ignore the pending_spent field.
-        // The reason is that pending spents are only in memory, and we need to get the actual value of spent
-        // from the blockchain anyway.
-        let spent = Optional::read(&mut reader, |r| {
+        let nullifier = match external_version {
+            5.. => Optional::read(&mut reader, read_nullifier)?,
+            ..5 => Some(read_nullifier(&mut reader)?),
+        };
+
+        let spend = Optional::read(&mut reader, |r| {
             let mut transaction_id_bytes = [0u8; 32];
             r.read_exact(&mut transaction_id_bytes)?;
-            let height = r.read_u32::<LittleEndian>()?;
-            Ok((TxId::from_bytes(transaction_id_bytes), height))
+            let status = match external_version {
+                5.. => ConfirmationStatus::read(r, ()),
+                ..5 => {
+                    let height = r.read_u32::<LittleEndian>()?;
+                    Ok(ConfirmationStatus::Confirmed(BlockHeight::from_u32(height)))
+                }
+            }?;
+            Ok((TxId::from_bytes(transaction_id_bytes), status))
         })?;
 
+        // Note that the spent field is now an enum, that contains what used to be
+        // a separate 'pending_spent' field. As they're mutually exclusive states,
+        // they are now stored in the same field.
         if external_version < 3 {
             let _pending_spent = {
                 Optional::read(&mut reader, |r| {
@@ -1178,10 +1207,9 @@ where
         Ok(T::from_parts(
             diversifier,
             note,
-            Some(witnessed_position),
-            Some(nullifier),
-            spent,
-            None,
+            witnessed_position,
+            nullifier,
+            spend,
             memo,
             is_change,
             have_spending_key,
@@ -1189,36 +1217,27 @@ where
         ))
     }
 
-    fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write<W: Write>(&self, mut writer: W, _input: ()) -> io::Result<()> {
         // Write a version number first, so we can later upgrade this if needed.
         writer.write_u8(Self::VERSION)?;
 
         writer.write_all(&self.diversifier().to_bytes())?;
 
-        self.note().write(&mut writer)?;
-        writer.write_u64::<LittleEndian>(u64::from(self.witnessed_position().ok_or(
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Tried to write note without knowing its the position of its value commitment",
-            ),
-        )?))?;
+        self.note().write(&mut writer, ())?;
+        Optional::write(&mut writer, *self.witnessed_position(), |w, pos| {
+            w.write_u64::<LittleEndian>(u64::from(pos))
+        })?;
 
-        writer.write_all(
-            &self
-                .nullifier()
-                .ok_or(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Tried to write note with unknown nullifier",
-                ))?
-                .to_bytes(),
-        )?;
+        Optional::write(&mut writer, self.nullifier(), |w, null| {
+            w.write_all(&null.to_bytes())
+        })?;
 
         Optional::write(
             &mut writer,
-            self.spent().as_ref(),
-            |w, (transaction_id, height)| {
+            self.spending_tx_status().as_ref(),
+            |w, &(transaction_id, status)| {
                 w.write_all(transaction_id.as_ref())?;
-                w.write_u32::<LittleEndian>(*height)
+                status.write(w, ())
             },
         )?;
 
@@ -1233,5 +1252,148 @@ where
         writer.write_u32::<LittleEndian>(self.output_index().unwrap_or(u32::MAX))?;
 
         Ok(())
+    }
+}
+
+impl ReadableWriteable for ConfirmationStatus {
+    const VERSION: u8 = 0;
+
+    fn read<R: Read>(mut reader: R, _input: ()) -> io::Result<Self> {
+        let _external_version = Self::get_version(&mut reader);
+        let status = reader.read_u8()?;
+        let height = BlockHeight::from_u32(reader.read_u32::<LittleEndian>()?);
+        match status {
+            0 => Ok(Self::Calculated(height)),
+            1 => Ok(Self::Transmitted(height)),
+            2 => Ok(Self::Mempool(height)),
+            3 => Ok(Self::Confirmed(height)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Bad confirmation status",
+            )),
+        }
+    }
+
+    fn write<W: Write>(&self, mut writer: W, _input: ()) -> io::Result<()> {
+        writer.write_u8(Self::VERSION)?;
+        let height = match self {
+            ConfirmationStatus::Calculated(h) => {
+                writer.write_u8(0)?;
+                h
+            }
+            ConfirmationStatus::Transmitted(h) => {
+                writer.write_u8(1)?;
+                h
+            }
+            ConfirmationStatus::Mempool(h) => {
+                writer.write_u8(2)?;
+                h
+            }
+            ConfirmationStatus::Confirmed(h) => {
+                writer.write_u8(3)?;
+                h
+            }
+        };
+        writer.write_u32::<LittleEndian>(u32::from(*height))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Cursor;
+
+    use bip0039::Mnemonic;
+    use orchard::keys::Diversifier;
+    use zcash_primitives::{consensus::BlockHeight, transaction::TxId};
+    use zingo_status::confirmation_status::ConfirmationStatus;
+
+    use crate::{
+        config::ZingoConfig,
+        mocks::orchard_note::OrchardCryptoNoteBuilder,
+        testvectors::seeds::ABANDON_ART_SEED,
+        wallet::{
+            keys::unified::WalletCapability,
+            notes::{orchard::mocks::OrchardNoteBuilder, OrchardNote},
+        },
+    };
+
+    use super::ReadableWriteable;
+
+    const V4_SERIALZED_NOTES: [u8; 302] = [
+        4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 53, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 53, 12, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73,
+        73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 12, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    ];
+
+    #[test]
+    fn check_v5_pending_note_read_write() {
+        let wc = WalletCapability::new_from_phrase(
+            &ZingoConfig::create_unconnected(crate::config::ChainType::Mainnet, None),
+            &Mnemonic::from_phrase(ABANDON_ART_SEED).unwrap(),
+            0,
+        )
+        .unwrap();
+        let recipient = orchard::keys::FullViewingKey::try_from(wc.unified_key_store())
+            .unwrap()
+            .address(Diversifier::from_bytes([0; 11]), zip32::Scope::External);
+
+        let mut note_builder = OrchardNoteBuilder::new();
+        note_builder.note(
+            OrchardCryptoNoteBuilder::non_random([0; 32])
+                .recipient(recipient)
+                .clone(),
+        );
+        let unspent_orchard_note = note_builder.clone().build();
+        note_builder.note(
+            OrchardCryptoNoteBuilder::non_random([73; 32])
+                .recipient(recipient)
+                .clone(),
+        );
+        let spent_orchard_note = note_builder
+            .clone()
+            .spending_tx_status(Some((
+                TxId::from_bytes([0; 32]),
+                ConfirmationStatus::Confirmed(BlockHeight::from(12)),
+            )))
+            .build();
+        note_builder.note(
+            OrchardCryptoNoteBuilder::non_random([113; 32])
+                .recipient(recipient)
+                .clone(),
+        );
+        let mempool_orchard_note = note_builder
+            .clone()
+            .spending_tx_status(Some((
+                TxId::from_bytes([1; 32]),
+                ConfirmationStatus::Mempool(BlockHeight::from(13)),
+            )))
+            .build();
+
+        let mut cursor = Cursor::new(V4_SERIALZED_NOTES);
+
+        let unspent_note_from_v4 = OrchardNote::read(&mut cursor, (&wc, None)).unwrap();
+        let spent_note_from_v4 = OrchardNote::read(&mut cursor, (&wc, None)).unwrap();
+
+        assert_eq!(cursor.position() as usize, cursor.get_ref().len());
+
+        assert_eq!(unspent_note_from_v4, unspent_orchard_note);
+        assert_eq!(spent_note_from_v4, spent_orchard_note);
+
+        let mut mempool_note_bytes_v5 = vec![];
+        mempool_orchard_note
+            .write(&mut mempool_note_bytes_v5, ())
+            .unwrap();
+        let mempool_note_from_v5 =
+            OrchardNote::read(mempool_note_bytes_v5.as_slice(), (&wc, None)).unwrap();
+
+        assert_eq!(mempool_note_from_v5, mempool_orchard_note);
     }
 }

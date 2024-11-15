@@ -5,8 +5,11 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 
 use zcash_client_backend::PoolType;
 use zcash_primitives::transaction::{components::OutPoint, TxId};
+use zingo_status::confirmation_status::ConfirmationStatus;
 
-use crate::wallet::notes::{query::OutputSpendStatusQuery, OutputInterface};
+use crate::wallet::notes::{
+    interface::OutputConstructor, query::OutputSpendStatusQuery, OutputInterface,
+};
 use crate::wallet::transaction_record::TransactionRecord;
 
 /// TODO: Add Doc Comment Here!
@@ -23,11 +26,8 @@ pub struct TransparentOutput {
     /// TODO: Add Doc Comment Here!
     pub value: u64,
 
-    spent: Option<(TxId, u32)>, // If this utxo was confirmed spent Todo: potential data incoherence with pending_spent
-
-    /// If this utxo was spent in a send, but has not yet been confirmed.
-    /// Contains the txid and height at which the Tx was broadcast
-    pub pending_spent: Option<(TxId, u32)>,
+    /// whether, where, and when it was spent
+    spend: Option<(TxId, ConfirmationStatus)>,
 }
 
 impl OutputInterface for TransparentOutput {
@@ -39,26 +39,19 @@ impl OutputInterface for TransparentOutput {
         self.value
     }
 
-    fn spent(&self) -> &Option<(TxId, u32)> {
-        &self.spent
+    fn spending_tx_status(&self) -> &Option<(TxId, ConfirmationStatus)> {
+        &self.spend
     }
 
-    fn spent_mut(&mut self) -> &mut Option<(TxId, u32)> {
-        &mut self.spent
+    fn spending_tx_status_mut(&mut self) -> &mut Option<(TxId, ConfirmationStatus)> {
+        &mut self.spend
     }
-
-    fn pending_spent(&self) -> &Option<(TxId, u32)> {
-        &self.pending_spent
-    }
-
-    fn pending_spent_mut(&mut self) -> &mut Option<(TxId, u32)> {
-        &mut self.pending_spent
-    }
-
-    fn transaction_record_to_outputs_vec(transaction_record: &TransactionRecord) -> Vec<&Self> {
+}
+impl OutputConstructor for TransparentOutput {
+    fn get_record_outputs(transaction_record: &TransactionRecord) -> Vec<&Self> {
         transaction_record.transparent_outputs.iter().collect()
     }
-    fn transaction_record_to_outputs_vec_query(
+    fn get_record_query_matching_outputs(
         transaction_record: &TransactionRecord,
         spend_status_query: OutputSpendStatusQuery,
     ) -> Vec<&Self> {
@@ -68,12 +61,10 @@ impl OutputInterface for TransparentOutput {
             .filter(|output| output.spend_status_query(spend_status_query))
             .collect()
     }
-    fn transaction_record_to_outputs_vec_mut(
-        transaction_record: &mut TransactionRecord,
-    ) -> Vec<&mut Self> {
+    fn get_record_to_outputs_mut(transaction_record: &mut TransactionRecord) -> Vec<&mut Self> {
         transaction_record.transparent_outputs.iter_mut().collect()
     }
-    fn transaction_record_to_outputs_vec_query_mut(
+    fn get_record_query_matching_outputs_mut(
         transaction_record: &mut TransactionRecord,
         spend_status_query: OutputSpendStatusQuery,
     ) -> Vec<&mut Self> {
@@ -93,8 +84,7 @@ impl TransparentOutput {
         output_index: u64,
         script: Vec<u8>,
         value: u64,
-        spent: Option<(TxId, u32)>,
-        pending_spent: Option<(TxId, u32)>,
+        spend: Option<(TxId, ConfirmationStatus)>,
     ) -> Self {
         Self {
             address,
@@ -102,8 +92,7 @@ impl TransparentOutput {
             output_index,
             script,
             value,
-            spent,
-            pending_spent,
+            spend,
         }
     }
 
@@ -130,11 +119,13 @@ impl TransparentOutput {
         writer.write_u64::<byteorder::LittleEndian>(self.value)?;
         writer.write_i32::<byteorder::LittleEndian>(0)?;
 
-        let (spent, spent_at_height) = if let Some(spent_tuple) = self.spent {
-            (Some(spent_tuple.0), Some(spent_tuple.1 as i32))
-        } else {
-            (None, None)
-        };
+        let confirmed_spend = self
+            .spending_tx_status()
+            .as_ref()
+            .and_then(|(txid, status)| status.get_confirmed_height().map(|height| (txid, height)));
+
+        let spent = confirmed_spend.map(|(txid, _height)| txid);
+        let spent_at_height = confirmed_spend.map(|(_txid, height)| u32::from(height) as i32);
 
         zcash_encoding::Vector::write(&mut writer, &self.script, |w, b| w.write_all(&[*b]))?;
 
@@ -208,6 +199,8 @@ impl TransparentOutput {
         } else {
             None
         };
+        let spend =
+            spent_tuple.map(|(txid, height)| (txid, ConfirmationStatus::Confirmed(height.into())));
 
         Ok(TransparentOutput {
             address,
@@ -215,18 +208,18 @@ impl TransparentOutput {
             output_index,
             script,
             value,
-            spent: spent_tuple,
-            pending_spent: None,
+            spend,
         })
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-elevation"))]
 pub mod mocks {
     //! Mock version of the struct for testing
     use zcash_primitives::{legacy::TransparentAddress, transaction::TxId};
+    use zingo_status::confirmation_status::ConfirmationStatus;
 
-    use crate::{mocks::build_method, wallet::notes::TransparentOutput};
+    use crate::{utils::build_method, wallet::notes::TransparentOutput};
 
     /// to create a mock TransparentOutput
     #[derive(Clone)]
@@ -236,8 +229,7 @@ pub mod mocks {
         pub output_index: Option<u64>,
         script: Option<Vec<u8>>,
         value: Option<u64>,
-        spent: Option<Option<(TxId, u32)>>,
-        pending_spent: Option<Option<(TxId, u32)>>,
+        spending_tx_status: Option<Option<(TxId, ConfirmationStatus)>>,
     }
     #[allow(dead_code)] //TODO:  fix this gross hack that I tossed in to silence the language-analyzer false positive
     impl TransparentOutputBuilder {
@@ -249,8 +241,7 @@ pub mod mocks {
                 output_index: None,
                 script: None,
                 value: None,
-                spent: None,
-                pending_spent: None,
+                spending_tx_status: None,
             }
         }
         // Methods to set each field
@@ -259,8 +250,7 @@ pub mod mocks {
         build_method!(output_index, u64);
         build_method!(script, Vec<u8>);
         build_method!(value, u64);
-        build_method!(spent, Option<(TxId, u32)>);
-        build_method!(pending_spent, Option<(TxId, u32)>);
+        build_method!(spending_tx_status, Option<(TxId, ConfirmationStatus)>);
 
         /// builds a mock TransparentNote after all pieces are supplied
         pub fn build(&self) -> TransparentOutput {
@@ -270,8 +260,7 @@ pub mod mocks {
                 self.output_index.unwrap(),
                 self.script.clone().unwrap(),
                 self.value.unwrap(),
-                self.spent.unwrap(),
-                self.pending_spent.unwrap(),
+                self.spending_tx_status.unwrap(),
             )
         }
     }
@@ -285,8 +274,7 @@ pub mod mocks {
                 .output_index(0)
                 .script(TransparentAddress::ScriptHash([0; 20]).script().0)
                 .value(100_000)
-                .spent(None)
-                .pending_spent(None);
+                .spending_tx_status(None);
             builder
         }
     }

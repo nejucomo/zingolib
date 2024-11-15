@@ -2,6 +2,9 @@
 use incrementalmerkletree::Position;
 use zcash_client_backend::{PoolType, ShieldedProtocol};
 use zcash_primitives::{memo::Memo, transaction::TxId};
+use zingo_status::confirmation_status::ConfirmationStatus;
+
+use crate::wallet::notes::interface::OutputConstructor;
 
 use super::{
     super::data::TransactionRecord, query::OutputSpendStatusQuery, OutputInterface,
@@ -9,7 +12,7 @@ use super::{
 };
 
 /// TODO: Add Doc Comment Here!
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrchardNote {
     /// TODO: Add Doc Comment Here!
     pub diversifier: orchard::keys::Diversifier,
@@ -25,17 +28,13 @@ pub struct OrchardNote {
 
     pub(crate) nullifier: Option<orchard::note::Nullifier>,
 
-    /// If this note was confirmed spent
-    pub spent: Option<(TxId, u32)>, // Todo: as related to pending spent, this is potential data incoherence
-
-    /// If this note was spent in a send, but has not yet been confirmed.
-    /// Contains the transaction id and height at which it was broadcast
-    pub pending_spent: Option<(TxId, u32)>,
+    /// whether, where, and when it was spent
+    spend: Option<(TxId, ConfirmationStatus)>,
 
     /// TODO: Add Doc Comment Here!
     pub memo: Option<Memo>,
 
-    /// TODO: Add Doc Comment Here!
+    /// DEPRECATED
     pub is_change: bool,
 
     /// If the spending key is available in the wallet (i.e., whether to keep witness up-to-date)
@@ -51,26 +50,19 @@ impl OutputInterface for OrchardNote {
         self.orchard_crypto_note.value().inner()
     }
 
-    fn spent(&self) -> &Option<(TxId, u32)> {
-        &self.spent
+    fn spending_tx_status(&self) -> &Option<(TxId, ConfirmationStatus)> {
+        &self.spend
     }
 
-    fn spent_mut(&mut self) -> &mut Option<(TxId, u32)> {
-        &mut self.spent
+    fn spending_tx_status_mut(&mut self) -> &mut Option<(TxId, ConfirmationStatus)> {
+        &mut self.spend
     }
-
-    fn pending_spent(&self) -> &Option<(TxId, u32)> {
-        &self.pending_spent
-    }
-
-    fn pending_spent_mut(&mut self) -> &mut Option<(TxId, u32)> {
-        &mut self.pending_spent
-    }
-
-    fn transaction_record_to_outputs_vec(transaction_record: &TransactionRecord) -> Vec<&Self> {
+}
+impl OutputConstructor for OrchardNote {
+    fn get_record_outputs(transaction_record: &TransactionRecord) -> Vec<&Self> {
         transaction_record.orchard_notes.iter().collect()
     }
-    fn transaction_record_to_outputs_vec_query(
+    fn get_record_query_matching_outputs(
         transaction_record: &TransactionRecord,
         spend_status_query: OutputSpendStatusQuery,
     ) -> Vec<&Self> {
@@ -80,12 +72,10 @@ impl OutputInterface for OrchardNote {
             .filter(|output| output.spend_status_query(spend_status_query))
             .collect()
     }
-    fn transaction_record_to_outputs_vec_mut(
-        transaction_record: &mut TransactionRecord,
-    ) -> Vec<&mut Self> {
+    fn get_record_to_outputs_mut(transaction_record: &mut TransactionRecord) -> Vec<&mut Self> {
         transaction_record.orchard_notes.iter_mut().collect()
     }
-    fn transaction_record_to_outputs_vec_query_mut(
+    fn get_record_query_matching_outputs_mut(
         transaction_record: &mut TransactionRecord,
         spend_status_query: OutputSpendStatusQuery,
     ) -> Vec<&mut Self> {
@@ -116,8 +106,7 @@ impl ShieldedNoteInterface for OrchardNote {
         orchard_crypto_note: Self::Note,
         witnessed_position: Option<Position>,
         nullifier: Option<Self::Nullifier>,
-        spent: Option<(TxId, u32)>,
-        pending_spent: Option<(TxId, u32)>,
+        spend: Option<(TxId, ConfirmationStatus)>,
         memo: Option<Memo>,
         is_change: bool,
         have_spending_key: bool,
@@ -128,8 +117,7 @@ impl ShieldedNoteInterface for OrchardNote {
             orchard_crypto_note,
             witnessed_position,
             nullifier,
-            spent,
-            pending_spent,
+            spend,
             memo,
             is_change,
             have_spending_key,
@@ -198,20 +186,25 @@ impl ShieldedNoteInterface for OrchardNote {
         &self.output_index
     }
 
+    fn output_index_mut(&mut self) -> &mut Option<u32> {
+        &mut self.output_index
+    }
+
     fn to_zcb_note(&self) -> zcash_client_backend::wallet::Note {
         zcash_client_backend::wallet::Note::Orchard(*self.note())
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-elevation"))]
 pub mod mocks {
     //! Mock version of the struct for testing
     use incrementalmerkletree::Position;
     use orchard::{keys::Diversifier, note::Nullifier, value::NoteValue};
     use zcash_primitives::{memo::Memo, transaction::TxId};
+    use zingo_status::confirmation_status::ConfirmationStatus;
 
     use crate::{
-        mocks::{build_method, orchard_note::OrchardCryptoNoteBuilder},
+        mocks::orchard_note::OrchardCryptoNoteBuilder, utils::build_method,
         wallet::notes::ShieldedNoteInterface,
     };
 
@@ -225,29 +218,20 @@ pub mod mocks {
         witnessed_position: Option<Option<Position>>,
         pub output_index: Option<Option<u32>>,
         nullifier: Option<Option<Nullifier>>,
-        spent: Option<Option<(TxId, u32)>>,
-        pending_spent: Option<Option<(TxId, u32)>>,
+        spending_tx_status: Option<Option<(TxId, ConfirmationStatus)>>,
         memo: Option<Option<Memo>>,
         is_change: Option<bool>,
         have_spending_key: Option<bool>,
     }
 
-    #[allow(dead_code)] //TODO:  fix this gross hack that I tossed in to silence the language-analyzer false positive
     impl OrchardNoteBuilder {
-        /// blank builder
+        #[allow(dead_code)] //TODO:  fix this gross hack that I tossed in to silence the language-analyzer false positive
+        /// A builder, for a 'blank' note.
+        /// Be aware that two notes generated with
+        /// this function will be identical if built
+        /// with no changes.
         pub fn new() -> Self {
-            OrchardNoteBuilder {
-                diversifier: None,
-                note: None,
-                witnessed_position: None,
-                output_index: None,
-                nullifier: None,
-                spent: None,
-                pending_spent: None,
-                memo: None,
-                is_change: None,
-                have_spending_key: None,
-            }
+            Self::default()
         }
 
         // Methods to set each field
@@ -256,8 +240,7 @@ pub mod mocks {
         build_method!(witnessed_position, Option<Position>);
         build_method!(output_index, Option<u32>);
         build_method!(nullifier, Option<Nullifier>);
-        build_method!(spent, Option<(TxId, u32)>);
-        build_method!(pending_spent, Option<(TxId, u32)>);
+        build_method!(spending_tx_status, Option<(TxId, ConfirmationStatus)>);
         build_method!(memo, Option<Memo>);
         #[doc = "Set the is_change field of the builder."]
         pub fn set_change(&mut self, is_change: bool) -> &mut Self {
@@ -280,8 +263,7 @@ pub mod mocks {
                 self.note.clone().unwrap().build(),
                 self.witnessed_position.unwrap(),
                 self.nullifier.unwrap(),
-                self.spent.unwrap(),
-                self.pending_spent.unwrap(),
+                self.spending_tx_status.unwrap(),
                 self.memo.clone().unwrap(),
                 self.is_change.unwrap(),
                 self.have_spending_key.unwrap(),
@@ -292,15 +274,24 @@ pub mod mocks {
 
     impl Default for OrchardNoteBuilder {
         fn default() -> Self {
-            let mut builder = OrchardNoteBuilder::new();
+            let mut builder = OrchardNoteBuilder {
+                diversifier: None,
+                note: None,
+                witnessed_position: None,
+                output_index: None,
+                nullifier: None,
+                spending_tx_status: None,
+                memo: None,
+                is_change: None,
+                have_spending_key: None,
+            };
             builder
                 .diversifier(Diversifier::from_bytes([0; 11]))
                 .note(OrchardCryptoNoteBuilder::default())
                 .witnessed_position(Some(Position::from(0)))
                 .output_index(Some(0))
                 .nullifier(Some(Nullifier::from_bytes(&[0u8; 32]).unwrap()))
-                .spent(None)
-                .pending_spent(None)
+                .spending_tx_status(None)
                 .memo(None)
                 .set_change(false)
                 .have_spending_key(true);

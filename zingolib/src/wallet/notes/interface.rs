@@ -3,6 +3,7 @@
 use incrementalmerkletree::{Hashable, Position};
 use zcash_client_backend::{PoolType, ShieldedProtocol};
 use zcash_primitives::{memo::Memo, merkle_tree::HashSer, transaction::TxId};
+use zingo_status::confirmation_status::ConfirmationStatus;
 
 use crate::wallet::{
     keys::unified::WalletCapability,
@@ -11,7 +12,25 @@ use crate::wallet::{
     transaction_record::TransactionRecord,
 };
 
+/// Trait methods of Outputs that aren't static (i.e. don't take self)
+pub trait OutputConstructor {
+    /// Returns the Outputs in the TransactionRecord in this pool.
+    fn get_record_outputs(transaction_record: &TransactionRecord) -> Vec<&Self>;
+    /// Returns the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
+    fn get_record_query_matching_outputs(
+        transaction_record: &TransactionRecord,
+        spend_status_query: OutputSpendStatusQuery,
+    ) -> Vec<&Self>;
+    /// Returns the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
+    fn get_record_to_outputs_mut(transaction_record: &mut TransactionRecord) -> Vec<&mut Self>;
+    /// Returns the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
+    fn get_record_query_matching_outputs_mut(
+        transaction_record: &mut TransactionRecord,
+        spend_status_query: OutputSpendStatusQuery,
+    ) -> Vec<&mut Self>;
+}
 /// Expresses the behavior that *all* value transfers MUST support (inclusive of transparent).
+#[enum_dispatch::enum_dispatch]
 pub trait OutputInterface: Sized {
     /// returns the zcash_client_backend PoolType enum (one of 3)
     /// Where lrz splits between shielded and transparent, zingolib
@@ -24,35 +43,36 @@ pub trait OutputInterface: Sized {
     fn value(&self) -> u64;
 
     /// If the funds are spent, the TxId and Blockheight of record
-    fn spent(&self) -> &Option<(TxId, u32)>;
+    fn spending_tx_status(&self) -> &Option<(TxId, ConfirmationStatus)>;
 
     /// Mutable access to the spent field.. hmm  NOTE:  Should we keep this pattern?
     /// what is spent becomes a Vec<OnceCell(TxiD, u32)>, where the last element of that
     /// Vec is the last known block chain record of the spend.  So then reorgs, just extend
     /// the Vec which tracks all BlockChain records of the value-transfer
-    fn spent_mut(&mut self) -> &mut Option<(TxId, u32)>;
+    fn spending_tx_status_mut(&mut self) -> &mut Option<(TxId, ConfirmationStatus)>;
 
-    /// The TxId and broadcast height of a transfer that's not known to be on-record on the chain
-    fn pending_spent(&self) -> &Option<(TxId, u32)>;
-
-    /// TODO: Add Doc Comment Here!
-    fn pending_spent_mut(&mut self) -> &mut Option<(TxId, u32)>;
+    /// returns the id of the spending transaction, whether pending or no
+    fn spending_txid(&self) -> Option<TxId> {
+        self.spending_tx_status().map(|(txid, _status)| txid)
+    }
 
     /// Returns true if the note has been presumptively spent but the spent has not been validated.
     fn is_pending_spent(&self) -> bool {
-        self.pending_spent().is_some()
+        self.spending_tx_status()
+            .is_some_and(|(_txid, status)| !status.is_confirmed())
     }
 
-    /// returns true if the note is confirmed spent
-    fn is_spent(&self) -> bool {
-        self.spent().is_some()
+    /// returns true if the note is spent and the spend is validated confirmed on chain
+    fn is_spent_confirmed(&self) -> bool {
+        self.spending_tx_status()
+            .is_some_and(|(_txid, status)| status.is_confirmed())
     }
 
     /// Returns true if the note has one of the spend statuses enumerated by the query
     fn spend_status_query(&self, query: OutputSpendStatusQuery) -> bool {
-        (*query.unspent() && !self.is_spent() && !self.is_pending_spent())
+        (*query.unspent() && !self.is_spent_confirmed() && !self.is_pending_spent())
             || (*query.pending_spent() && self.is_pending_spent())
-            || (*query.spent() && self.is_spent())
+            || (*query.spent() && self.is_spent_confirmed())
     }
 
     /// Returns true if the note is unspent (spendable).
@@ -73,32 +93,15 @@ pub trait OutputInterface: Sized {
     fn query(&self, query: OutputQuery) -> bool {
         self.spend_status_query(*query.spend_status()) && self.pool_query(*query.pools())
     }
-
-    /// Returns a vec of the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
-    fn transaction_record_to_outputs_vec(transaction_record: &TransactionRecord) -> Vec<&Self>;
-    /// Returns a vec of the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
-    fn transaction_record_to_outputs_vec_query(
-        transaction_record: &TransactionRecord,
-        spend_status_query: OutputSpendStatusQuery,
-    ) -> Vec<&Self>;
-    /// Returns a vec of the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
-    fn transaction_record_to_outputs_vec_mut(
-        transaction_record: &mut TransactionRecord,
-    ) -> Vec<&mut Self>;
-    /// Returns a vec of the Outputs in the TransactionRecord that fit the OutputSpendStatusQuery in this pool.
-    fn transaction_record_to_outputs_vec_query_mut(
-        transaction_record: &mut TransactionRecord,
-        spend_status_query: OutputSpendStatusQuery,
-    ) -> Vec<&mut Self>;
 }
 
 ///   ShieldedNotes are either part of a Sapling or Orchard Pool
-pub trait ShieldedNoteInterface: OutputInterface + Sized {
+pub trait ShieldedNoteInterface: OutputInterface + OutputConstructor + Sized {
     /// TODO: Add Doc Comment Here!
     type Diversifier: Copy + FromBytes<11> + ToBytes<11>;
     /// TODO: Add Doc Comment Here!
     type Note: PartialEq
-        + for<'a> ReadableWriteable<(Self::Diversifier, &'a WalletCapability)>
+        + for<'a> ReadableWriteable<(Self::Diversifier, &'a WalletCapability), ()>
         + Clone;
     /// TODO: Add Doc Comment Here!
     type Node: Hashable + HashSer + FromCommitment + Send + Clone + PartialEq + Eq;
@@ -115,8 +118,7 @@ pub trait ShieldedNoteInterface: OutputInterface + Sized {
         note: Self::Note,
         position_of_commitment_to_witness: Option<Position>,
         nullifier: Option<Self::Nullifier>,
-        spent: Option<(TxId, u32)>,
-        pending_spent: Option<(TxId, u32)>,
+        spend: Option<(TxId, ConfirmationStatus)>,
         memo: Option<Memo>,
         is_change: bool,
         have_spending_key: bool,
@@ -152,6 +154,9 @@ pub trait ShieldedNoteInterface: OutputInterface + Sized {
 
     /// TODO: Add Doc Comment Here!
     fn output_index(&self) -> &Option<u32>;
+
+    /// TODO: Add Doc Comment Here!
+    fn output_index_mut(&mut self) -> &mut Option<u32>;
 
     /// TODO: Add Doc Comment Here!
     fn pending_receipt(&self) -> bool {
